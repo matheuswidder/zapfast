@@ -409,6 +409,56 @@ fn sample_files(app: &App) -> (std::path::PathBuf, std::path::PathBuf) {
     (photo, sticker)
 }
 
+/// Writes a playable voice clip and points both voice messages at it, so the
+/// bubble draws its player rather than a download link.
+fn sample_voice_media(app: &mut App) {
+    // Use a valid clip for playback tests.
+    let tone: Vec<f32> = (0..crate::voice::RATE * 6)
+        .map(|i| {
+            let t = i as f32 / crate::voice::RATE as f32;
+            (t * 220.0 * std::f32::consts::TAU).sin() * 0.4 * (t * 1.3).sin().abs()
+        })
+        .collect();
+    let path = app.dirs.media_cache_dir().join("demo-voice.ogg");
+    if let Ok(bytes) = crate::voice::encode(&tone) {
+        let _ = std::fs::create_dir_all(path.parent().expect("a directory"));
+        let _ = std::fs::write(&path, bytes);
+    }
+    let waveform = crate::voice::waveform(&tone);
+    let open = app.open_chat.clone().unwrap_or_default();
+    for id in ["ada-voice", "you-voice"] {
+        if let Some(message) = app
+            .conversations
+            .get_mut(&open)
+            .and_then(|conversation| conversation.message_mut(id))
+            && let crate::model::Content::Audio {
+                media,
+                waveform: bars,
+                seconds,
+                ..
+            } = &mut message.content
+        {
+            media.path = Some(path.clone());
+            *bars = waveform.clone();
+            *seconds = Some(6);
+        }
+    }
+}
+
+/// Places a placeholder model on disk so the layout tests draw the bubble with
+/// its transcribe button, which only appears once a model is installed. The
+/// file is never read: the transcript states are seeded, not transcribed.
+fn sample_transcription_model(app: &App) {
+    let dir = crate::transcription::models_dir(&app.dirs);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = crate::transcription::selected_model(&app.settings)
+        .expect("a fresh setup picks a recommended model")
+        .path(&dir);
+    let _ = std::fs::write(path, b"demo model placeholder");
+}
+
 /// Loads the sample account and opens its first chat.
 pub fn populate(app: &mut App) {
     app.backend.set_offline(true);
@@ -2584,39 +2634,37 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.search_hits = hits;
             }
             "voice" => {
-                // Use a valid clip for playback tests.
-                let tone: Vec<f32> = (0..crate::voice::RATE * 6)
-                    .map(|i| {
-                        let t = i as f32 / crate::voice::RATE as f32;
-                        (t * 220.0 * std::f32::consts::TAU).sin() * 0.4 * (t * 1.3).sin().abs()
-                    })
-                    .collect();
-                let path = app.dirs.media_cache_dir().join("demo-voice.ogg");
-                if let Ok(bytes) = crate::voice::encode(&tone) {
-                    let _ = std::fs::create_dir_all(path.parent().expect("a directory"));
-                    let _ = std::fs::write(&path, bytes);
-                }
-                let waveform = crate::voice::waveform(&tone);
-                let open = app.open_chat.clone().unwrap_or_default();
-                for id in ["ada-voice", "you-voice"] {
-                    if let Some(message) = app
-                        .conversations
-                        .get_mut(&open)
-                        .and_then(|conversation| conversation.message_mut(id))
-                        && let crate::model::Content::Audio {
-                            media,
-                            waveform: bars,
-                            seconds,
-                            ..
-                        } = &mut message.content
-                    {
-                        media.path = Some(path.clone());
-                        *bars = waveform.clone();
-                        *seconds = Some(6);
-                    }
-                }
+                sample_voice_media(app);
             }
             "recording" => app.recording = Some(crate::audio::Recorder::rehearsal()),
+            // The Transcription extension drawing inside the audio bubble: a
+            // finished transcript, one still running, and one that failed.
+            "transcribed" => {
+                sample_voice_media(app);
+                app.settings.transcription_enabled = true;
+                sample_transcription_model(app);
+                app.transcriber.seed(
+                    "ada-voice",
+                    crate::transcription::TranscribeState::Done(
+                        "Oi, tudo bem? Vim te avisar que a reunião de amanhã mudou \
+                         para as quinze horas, e o relatório já está no drive."
+                            .to_owned(),
+                    ),
+                );
+                app.transcriber
+                    .seed("you-voice", crate::transcription::TranscribeState::Queued);
+            }
+            "transcribe-failed" => {
+                sample_voice_media(app);
+                app.settings.transcription_enabled = true;
+                sample_transcription_model(app);
+                app.transcriber.seed(
+                    "ada-voice",
+                    crate::transcription::TranscribeState::Failed("model missing".to_owned()),
+                );
+                app.transcriber
+                    .seed("you-voice", crate::transcription::TranscribeState::Running);
+            }
             // Shows the native image preview over the demo chat.
             "preview" => {
                 let (photo, _) = sample_files(app);
@@ -4335,6 +4383,8 @@ mod tests {
             "voice",
             "voice,voice-menu",
             "recording",
+            "transcribed",
+            "transcribe-failed",
             "preview",
             "gifs",
             "gifs-badkey",
