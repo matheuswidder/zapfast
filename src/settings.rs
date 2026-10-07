@@ -344,6 +344,42 @@ impl AutoLock {
     }
 }
 
+/// Which chats get their voice messages transcribed without a click.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionAuto {
+    #[default]
+    Off,
+    /// Only chats pinned on this account.
+    Pinned,
+    /// One-to-one chats, groups excluded.
+    Personal,
+    /// Every chat, groups included.
+    Everything,
+    /// Only the chats named in `transcription_chats`.
+    Specific,
+}
+
+impl TranscriptionAuto {
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Pinned,
+        Self::Personal,
+        Self::Everything,
+        Self::Specific,
+    ];
+
+    pub fn label(self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Off => crate::i18n::gettext(locale, "Off"),
+            Self::Pinned => crate::i18n::gettext(locale, "Pinned chats"),
+            Self::Personal => crate::i18n::gettext(locale, "Personal chats"),
+            Self::Everything => crate::i18n::gettext(locale, "Everything, groups included"),
+            Self::Specific => crate::i18n::gettext(locale, "Chosen chats"),
+        }
+    }
+}
+
 /// The sound a new-message notification makes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -488,6 +524,17 @@ pub struct Settings {
     pub window_y: Option<f32>,
     /// Whether the window was maximized when it last closed.
     pub window_maximized: bool,
+    /// The Transcription extension: local Whisper over voice messages.
+    pub transcription_enabled: bool,
+    /// Key of the active Whisper model, one of [`crate::transcription::MODELS`].
+    pub transcription_model: Option<String>,
+    /// Transcribe in Portuguese instead of letting the model detect the
+    /// language.
+    pub transcription_portuguese: bool,
+    /// Which chats have their voice messages transcribed on their own.
+    pub transcription_auto: TranscriptionAuto,
+    /// Chats transcribed on their own when the scope is specific chats.
+    pub transcription_chats: Vec<String>,
 }
 
 impl Default for Settings {
@@ -541,6 +588,11 @@ impl Default for Settings {
             window_x: None,
             window_y: None,
             window_maximized: false,
+            transcription_enabled: false,
+            transcription_model: None,
+            transcription_portuguese: true,
+            transcription_auto: TranscriptionAuto::Off,
+            transcription_chats: Vec::new(),
         }
     }
 }
@@ -904,6 +956,57 @@ mod tests {
         assert_eq!(parsed.window_x, None);
         assert_eq!(parsed.window_y, None);
         assert!(!parsed.window_maximized);
+    }
+
+    /// Transcription arrived after these files were written. An older settings
+    /// file must come back with the extension off rather than failing to
+    /// parse and resetting every other preference.
+    #[test]
+    fn transcription_defaults_to_off_on_an_older_file() {
+        let parsed: Settings = serde_json::from_str(r#"{"theme":"light"}"#).expect("parses");
+        assert!(!parsed.transcription_enabled);
+        assert_eq!(parsed.transcription_model, None);
+        assert!(parsed.transcription_portuguese);
+        assert_eq!(parsed.transcription_auto, TranscriptionAuto::Off);
+        assert!(parsed.transcription_chats.is_empty());
+    }
+
+    #[test]
+    fn transcription_survives_a_round_trip() {
+        let settings = Settings {
+            transcription_enabled: true,
+            transcription_model: Some("turbo".to_owned()),
+            transcription_portuguese: false,
+            transcription_auto: TranscriptionAuto::Specific,
+            transcription_chats: vec!["1@s.whatsapp.net".to_owned()],
+            ..Settings::default()
+        };
+        let saved = serde_json::to_string(&settings).unwrap();
+        let parsed: Settings = serde_json::from_str(&saved).expect("parses");
+        assert_eq!(parsed, settings);
+        // Names, not indices: a file edited by hand has to stay readable.
+        assert!(saved.contains("\"turbo\""));
+        assert!(saved.contains("\"specific\""));
+    }
+
+    /// Every scope the picker offers needs a name that survives the file, and
+    /// only one of them is the default.
+    #[test]
+    fn every_transcription_scope_has_a_stable_name() {
+        assert_eq!(TranscriptionAuto::ALL.len(), 5);
+        assert_eq!(TranscriptionAuto::default(), TranscriptionAuto::Off);
+        let mut names: Vec<String> = TranscriptionAuto::ALL
+            .iter()
+            .map(|scope| serde_json::to_string(scope).unwrap())
+            .collect();
+        let count = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), count, "two scopes share a name");
+        for scope in TranscriptionAuto::ALL {
+            let text = serde_json::to_string(&scope).unwrap();
+            assert!(serde_json::from_str::<TranscriptionAuto>(&text).is_ok());
+        }
     }
 
     #[test]

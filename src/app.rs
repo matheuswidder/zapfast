@@ -469,6 +469,14 @@ pub struct App {
     pub composer_tools_open: bool,
     /// In-chat audio player.
     pub player: Player,
+    /// Local speech-to-text of the Transcription extension.
+    pub transcriber: crate::transcription::Transcriber,
+    /// Clips the automatic scope wanted transcribed before any model was
+    /// installed. Retried when one finishes downloading; chat, message, path.
+    pending_transcription: Vec<(String, String, PathBuf)>,
+    /// Downloads the interface has already reacted to, so it retries the
+    /// pending clips once per settled download rather than once per frame.
+    settled_downloads: u64,
     /// In-chat video player.
     pub video: crate::video::Player,
     /// Chat of the loaded video; leaving it stops the video.
@@ -1053,6 +1061,9 @@ impl App {
             pending: Vec::new(),
             composer_tools_open: false,
             player: Player::new(waker.clone()),
+            transcriber: crate::transcription::Transcriber::new(waker.clone()),
+            pending_transcription: Vec::new(),
+            settled_downloads: 0,
             video: crate::video::Player::new(waker.clone()),
             video_chat: None,
             video_wanted: None,
@@ -3433,16 +3444,23 @@ impl App {
                     self.video_wanted = None;
                     self.actions.push(Action::PlayVideo {
                         message: id.to_owned(),
-                        path,
+                        path: path.clone(),
                     });
                 } else if want_voice {
                     self.voice_wanted = None;
                     if open {
                         self.actions.push(Action::PlayVoice {
                             message: id.to_owned(),
-                            path,
+                            path: path.clone(),
                         });
                     }
+                }
+                if self.transcribes_automatically(chat) {
+                    self.actions.push(Action::TranscribeVoice {
+                        chat: chat.to_owned(),
+                        message: id.to_owned(),
+                        path,
+                    });
                 }
             }
             Err(()) => {
@@ -3920,6 +3938,14 @@ impl App {
             if account.settings_dirty {
                 account.save_settings();
             }
+        }
+        // Clips waiting for a model are picked up as soon as one lands. Keyed on the
+        // download count so an idle frame costs nothing.
+        if !self.pending_transcription.is_empty()
+            && self.transcriber.settled_downloads() != self.settled_downloads
+        {
+            self.settled_downloads = self.transcriber.settled_downloads();
+            self.retry_pending_transcriptions();
         }
         if !self.typing.is_empty() || self.composing {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -4715,6 +4741,62 @@ impl App {
             }
             Action::SetVoiceSpeed(speed) => {
                 self.settings.voice_speed = self.player.set_speed(speed);
+                self.mark_settings_dirty();
+            }
+            Action::TranscribeVoice {
+                chat,
+                message,
+                path,
+            } => {
+                self.transcribe_voice(chat, message, path);
+            }
+            Action::SetTranscriptionModel(key) => {
+                if self.settings.transcription_model.as_deref() != Some(key) {
+                    self.settings.transcription_model = Some(key.to_owned());
+                    // Transcripts made by the old model would sit beside new
+                    // ones saying the same words, so they go.
+                    self.transcriber.forget_all();
+                    self.mark_settings_dirty();
+                }
+            }
+            Action::DownloadTranscriptionModel(key) => {
+                if let Some(model) = crate::transcription::model_by_key(key) {
+                    let dir = crate::transcription::models_dir(&self.dirs);
+                    self.transcriber.download(model, dir, self.waker.clone());
+                }
+            }
+            Action::CancelTranscriptionDownload(key) => {
+                self.transcriber.cancel_download(key);
+            }
+            Action::DeleteTranscriptionModel(key) => {
+                if let Some(model) = crate::transcription::model_by_key(key) {
+                    let dir = crate::transcription::models_dir(&self.dirs);
+                    if let Err(error) = crate::transcription::delete_model(model, &dir) {
+                        self.toast_error(error.to_string());
+                    } else if self.settings.transcription_model.as_deref() == Some(key) {
+                        self.settings.transcription_model = None;
+                        self.transcriber.forget_all();
+                        self.mark_settings_dirty();
+                    }
+                }
+            }
+            Action::SetTranscriptionPortuguese(on) => {
+                self.settings.transcription_portuguese = on;
+                self.mark_settings_dirty();
+            }
+            Action::SetTranscriptionAuto(scope) => {
+                self.settings.transcription_auto = scope;
+                self.mark_settings_dirty();
+            }
+            Action::SetTranscriptionChat { chat, on } => {
+                let chosen = &mut self.settings.transcription_chats;
+                if on {
+                    if !chosen.contains(&chat) {
+                        chosen.push(chat);
+                    }
+                } else {
+                    chosen.retain(|existing| existing != &chat);
+                }
                 self.mark_settings_dirty();
             }
             Action::StartRecording => {
@@ -6132,6 +6214,86 @@ impl App {
             return;
         }
         self.tell_played(message);
+    }
+
+    /// Whether a voice message in `chat` is transcribed without a click.
+    fn transcribes_automatically(&self, chat: &str) -> bool {
+        use crate::settings::TranscriptionAuto;
+        if !self.settings.transcription_enabled {
+            return false;
+        }
+        match self.settings.transcription_auto {
+            TranscriptionAuto::Off => false,
+            TranscriptionAuto::Specific => self
+                .settings
+                .transcription_chats
+                .iter()
+                .any(|chosen| chosen == chat),
+            other => {
+                let Some(chat) = self.chats.iter().find(|row| row.id == chat) else {
+                    return false;
+                };
+                match other {
+                    TranscriptionAuto::Pinned => chat.pinned,
+                    TranscriptionAuto::Personal => !chat.is_group(),
+                    TranscriptionAuto::Everything => true,
+                    TranscriptionAuto::Off | TranscriptionAuto::Specific => false,
+                }
+            }
+        }
+    }
+
+    /// Hands a downloaded clip to the local Whisper model. When no model is
+    /// installed yet the clip is remembered instead, so a scope covering
+    /// every chat does not silently skip everything said before the first
+    /// download finished.
+    fn transcribe_voice(&mut self, chat: String, message: String, path: PathBuf) {
+        if !self.settings.transcription_enabled {
+            return;
+        }
+        let ready = crate::transcription::selected_model(&self.settings).is_some_and(|model| {
+            crate::transcription::model_downloaded(
+                model,
+                &crate::transcription::models_dir(&self.dirs),
+            )
+        });
+        if !ready {
+            let already = self
+                .pending_transcription
+                .iter()
+                .any(|(_, waiting, _)| waiting == &message);
+            if !already && self.transcribes_automatically(&chat) {
+                self.pending_transcription.push((chat, message, path));
+            }
+            return;
+        }
+        let Some(model) = crate::transcription::selected_model(&self.settings) else {
+            return;
+        };
+        let dir = crate::transcription::models_dir(&self.dirs);
+        // enqueue ignores a message already queued or running, and replaces
+        // a finished or failed transcript with a fresh run.
+        self.transcriber.enqueue(
+            message,
+            path,
+            model.path(&dir),
+            self.settings
+                .transcription_portuguese
+                .then(|| "pt".to_owned()),
+        );
+    }
+
+    /// Picks up what [`Self::transcribe_voice`] set aside. Called when a model
+    /// finishes downloading, and when the scope starts covering a chat that
+    /// had clips waiting for one.
+    fn retry_pending_transcriptions(&mut self) {
+        if self.pending_transcription.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_transcription);
+        for (chat, message, path) in pending {
+            self.transcribe_voice(chat, message, path);
+        }
     }
 
     fn tell_played(&mut self, message: String) {

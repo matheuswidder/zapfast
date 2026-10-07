@@ -1701,6 +1701,11 @@ struct View<'a> {
     animate: bool,
     player: &'a crate::audio::Player,
     video: &'a crate::video::Player,
+    /// Local speech-to-text of the Transcription extension.
+    transcriber: &'a crate::transcription::Transcriber,
+    /// The extension is on and its model is present, so a bubble may offer
+    /// the transcribe button.
+    transcription_ready: bool,
     copy_rows: &'a std::sync::Mutex<Vec<crate::transcript::Row>>,
 }
 
@@ -1807,6 +1812,14 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         animate: app.window_focused,
         player: &app.player,
         video: &app.video,
+        transcriber: &app.transcriber,
+        transcription_ready: app.settings.transcription_enabled
+            && crate::transcription::selected_model(&app.settings).is_some_and(|model| {
+                crate::transcription::model_downloaded(
+                    model,
+                    &crate::transcription::models_dir(&app.dirs),
+                )
+            }),
         copy_rows: app.copy_rows.as_ref(),
     };
     let mut actions = Vec::new();
@@ -3568,7 +3581,11 @@ fn settled_width(ui: &egui::Ui, view: &View<'_>, message: &Message, cap: f32) ->
     let card = message.quoted.is_some()
         || match &message.content {
             Content::Text { preview, .. } => preview.is_some(),
-            Content::Document { .. } | Content::Audio { .. } | Content::Poll { .. } => true,
+            Content::Document { .. } | Content::Poll { .. } => true,
+            // A transcript must not widen the player: it wraps downward.
+            Content::Audio { .. } => {
+                return Some(CARD_WIDTH.min(cap).max(0.0));
+            }
             Content::Interactive { card, .. } => card.is_some(),
             // Videos without a poster use the file-row layout, except the
             // round ones, which always draw as a circle.
@@ -4657,10 +4674,7 @@ fn content(
             seconds,
             waveform,
             ..
-        } => {
-            voice_player(ui, view, message, media, *seconds, waveform, width, actions);
-            None
-        }
+        } => voice_player(ui, view, message, media, *seconds, waveform, width, actions),
         Content::Document {
             media,
             file_name,
@@ -6840,9 +6854,11 @@ fn voice_player(
     waveform: &[u8],
     width: f32,
     actions: &mut Vec<Action>,
-) {
+) -> Option<Rect> {
     use crate::audio::State;
     let palette = view.palette;
+    // Nothing below the player, the transcript included, may widen the bubble.
+    ui.set_max_width(CARD_WIDTH.min(width));
     let status = view.player.status(&message.id);
     let button = 36.0;
     let bar_height = 30.0;
@@ -6876,6 +6892,9 @@ fn voice_player(
         Layout::left_to_right(Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
+            // Where the play button landed, for the small transcribe button
+            // in its corner.
+            let play_rect = Rect::from_min_size(ui.cursor().min, Vec2::splat(button));
             match (&media.path, &media.state) {
                 (None, MediaState::Downloading) => waiting(ui),
                 (None, _) => {
@@ -6923,6 +6942,63 @@ fn voice_player(
                         }
                     }
                 },
+            }
+            // The Transcription extension's button, tucked into the play
+            // button's corner. Registered without allocating space, so the
+            // row keeps its shape.
+            if shows_chip
+                && view.transcription_ready
+                && let Some(path) = &media.path
+            {
+                let size = 20.0;
+                let rect = Rect::from_min_size(
+                    pos2(
+                        play_rect.right() - size * 0.62,
+                        play_rect.bottom() - size * 0.62,
+                    ),
+                    Vec2::splat(size),
+                );
+                let id = ui.id().with(("transcribe", &view.chat.id, &message.id));
+                let response = ui.interact(rect, id, Sense::click());
+                let running = matches!(
+                    view.transcriber.status(&message.id),
+                    Some(crate::transcription::TranscribeState::Queued)
+                        | Some(crate::transcription::TranscribeState::Running)
+                );
+                let accent = running || response.hovered();
+                ui.painter().circle(
+                    rect.center(),
+                    size / 2.0,
+                    palette.surface,
+                    ui.style().visuals.widgets.inactive.bg_stroke,
+                );
+                theme::paint_icon(
+                    ui,
+                    Icon::Keyboard,
+                    rect.shrink(4.0),
+                    11.0,
+                    if accent {
+                        palette.accent
+                    } else {
+                        palette.secondary
+                    },
+                );
+                let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let response = if running {
+                    response.on_hover_text(crate::i18n::gettext(view.locale, "Transcribing"))
+                } else {
+                    let response =
+                        response.on_hover_text(crate::i18n::gettext(view.locale, "Transcribe"));
+                    if response.clicked() {
+                        actions.push(Action::TranscribeVoice {
+                            chat: view.chat.id.clone(),
+                            message: message.id.clone(),
+                            path: path.clone(),
+                        });
+                    }
+                    response
+                };
+                let _ = response;
             }
             let mut wave_middle = None;
             ui.vertical(|ui| {
@@ -7043,6 +7119,105 @@ fn voice_player(
             }
         },
     );
+    // The transcript, when this clip has one, sits below the player inside
+    // the same bubble. Session only: it lives in memory, never the archive.
+    // A finished transcript hands back the time's place on its last line, so
+    // the footer sits beside the copy button instead of under it.
+    let mut footer_slot = None;
+    if let Some(state) = view.transcriber.status(&message.id) {
+        let locale = view.locale;
+        match state {
+            crate::transcription::TranscribeState::Done(text) => {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                // Stay inside the player's width. A wrapping label asks for
+                // the widest line it could draw, which would stretch the bubble.
+                let wrap = width.max(0.0);
+                let galley =
+                    ui.painter()
+                        .layout(text.clone(), theme::regular(13.0), palette.text, wrap);
+                let (rect, _) = ui.allocate_exact_size(vec2(wrap, galley.size().y), Sense::hover());
+                ui.painter().galley(rect.min, galley, palette.text);
+                // Copy and the local note share the last line with the time.
+                // The row spans the bubble, so an outgoing bubble (which lays
+                // out from the right) still starts at the left, and the time's
+                // width stays empty at the right for the footer.
+                let time = footer_width(ui, message) + 10.0;
+                let (row, _) = ui.allocate_exact_size(vec2(width.max(0.0), 22.0), Sense::hover());
+                let note = crate::i18n::gettext(locale, "Transcribed on this computer");
+                let galley = ui.painter().layout_no_wrap(
+                    note.as_ref().to_owned(),
+                    theme::regular(11.0),
+                    palette.secondary,
+                );
+                let copy = Rect::from_min_size(row.min, Vec2::splat(22.0));
+                let response = ui
+                    .interact(
+                        copy,
+                        ui.id().with(("copy-transcript", &message.id)),
+                        Sense::click(),
+                    )
+                    .on_hover_text(crate::i18n::gettext(locale, "Copy transcript"));
+                theme::paint_icon(
+                    ui,
+                    Icon::Copy,
+                    copy.shrink(4.0),
+                    13.0,
+                    if response.hovered() {
+                        palette.text
+                    } else {
+                        palette.secondary
+                    },
+                );
+                if response.clicked() {
+                    actions.push(Action::CopyText(text.clone()));
+                }
+                let note_at = pos2(copy.right() + 2.0, row.center().y - galley.size().y / 2.0);
+                let note_width = (row.right() - time - note_at.x).max(0.0);
+                if galley.size().x <= note_width {
+                    ui.painter().galley(note_at, galley, palette.secondary);
+                }
+                footer_slot = Some(Rect::from_min_max(
+                    pos2(row.right() - time, row.bottom() - 15.0),
+                    row.right_bottom(),
+                ));
+            }
+            crate::transcription::TranscribeState::Queued
+            | crate::transcription::TranscribeState::Running => {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    theme::spinner(ui, 14.0, palette.accent);
+                    theme::text(
+                        ui,
+                        crate::i18n::gettext(locale, "Transcribing"),
+                        theme::regular(12.0),
+                        palette.secondary,
+                    );
+                });
+            }
+            crate::transcription::TranscribeState::Failed(_) => {
+                ui.add_space(6.0);
+                let response = ui
+                    .horizontal(|ui| {
+                        theme::text(
+                            ui,
+                            crate::i18n::gettext(locale, "Transcription failed"),
+                            theme::regular(12.0),
+                            palette.danger,
+                        );
+                        theme::text(
+                            ui,
+                            crate::i18n::gettext(locale, "Click the keyboard to retry"),
+                            theme::regular(12.0),
+                            palette.secondary,
+                        );
+                    })
+                    .response;
+                response.on_hover_text(crate::i18n::gettext(locale, "Transcription failed"));
+            }
+        }
+    }
     let auto = media.path.is_none()
         && matches!(media.state, MediaState::Idle)
         && view.auto_download
@@ -7054,6 +7229,7 @@ fn voice_player(
             message: message.id.clone(),
         });
     }
+    footer_slot
 }
 
 /// Voice-recording controls and live waveform.

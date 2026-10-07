@@ -115,6 +115,10 @@ opus = "0.4"
 ogg = "0.9"
 # Converts animated Signal APNG stickers to the animated WebP used by WhatsApp.
 webp-animation = "0.10"
+# Local speech-to-text for voice messages: the Whisper models the Transcription
+# extension downloads run in-process on the CPU. whisper-rs compiles whisper.cpp
+# with CMake, so a build needs cmake and a C++ compiler on every platform.
+whisper-rs = { version = "0.16", default-features = false }
 # Encodes stickers made from pictures as still lossy WebP. Already included
 # through webp-animation, whose animation encoder always writes an animation.
 libwebp-sys2 = { version = "0.2", features = ["1_2"] }

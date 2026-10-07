@@ -1387,6 +1387,31 @@ pub enum Action {
     },
     /// Sets the voice playback speed to one of the supported speeds.
     SetVoiceSpeed(f32),
+    /// Transcribes a downloaded voice or audio message with the local
+    /// Whisper model of the Transcription extension.
+    TranscribeVoice {
+        chat: String,
+        message: String,
+        path: PathBuf,
+    },
+    /// Makes an installed model the active one.
+    SetTranscriptionModel(&'static str),
+    /// Fetches a Whisper model into the state folder, with progress in the
+    /// settings.
+    DownloadTranscriptionModel(&'static str),
+    /// Stops a model download the reader started by mistake.
+    CancelTranscriptionDownload(&'static str),
+    /// Deletes a downloaded model to free disk space.
+    DeleteTranscriptionModel(&'static str),
+    /// Picks Portuguese or automatic language detection for the model.
+    SetTranscriptionPortuguese(bool),
+    /// Sets which chats have their voice messages transcribed on their own.
+    SetTranscriptionAuto(crate::settings::TranscriptionAuto),
+    /// Adds or removes one chat from the chosen-chat list.
+    SetTranscriptionChat {
+        chat: String,
+        on: bool,
+    },
     /// Plays or pauses a downloaded video inside its message.
     PlayVideo {
         message: String,

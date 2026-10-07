@@ -780,6 +780,92 @@ fn sections(app: &App) -> Vec<Section> {
         },
     );
 
+    let mut extensions = Section::new(translated(locale, "Extensions"));
+    extensions.toggle(
+        translated(locale, "Local transcription"),
+        translated(
+            locale,
+            "Transcribe voice messages on this computer with Whisper. Audio and text never leave it.",
+        ),
+        |settings| &mut settings.transcription_enabled,
+    );
+    if app.settings.transcription_enabled {
+        extensions.row(
+            translated(locale, "Transcription language"),
+            translated(locale, "Portuguese, or let the model detect the language."),
+            move |ui, app| {
+                use crate::i18n::gettext;
+                let selected = app.settings.transcription_portuguese;
+                let response = egui::ComboBox::from_id_salt("transcription_language")
+                    .selected_text(if selected {
+                        gettext(locale, "Portuguese")
+                    } else {
+                        gettext(locale, "Detect language")
+                    })
+                    .width(200.0_f32.min(ui.available_width()))
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(selected, gettext(locale, "Portuguese").as_ref())
+                            .clicked()
+                        {
+                            app.actions.push(Action::SetTranscriptionPortuguese(true));
+                        }
+                        if ui
+                            .selectable_label(
+                                !selected,
+                                gettext(locale, "Detect language").as_ref(),
+                            )
+                            .clicked()
+                        {
+                            app.actions.push(Action::SetTranscriptionPortuguese(false));
+                        }
+                    });
+                theme::reveal_focus(&response.response);
+            },
+        );
+        extensions.row(
+            translated(locale, "Transcribe automatically"),
+            translated(
+                locale,
+                "Voice messages in the chosen chats are transcribed as they arrive.",
+            ),
+            move |ui, app| {
+                use crate::settings::TranscriptionAuto;
+                let selected = app.settings.transcription_auto;
+                let response = egui::ComboBox::from_id_salt("transcription_auto")
+                    .selected_text(selected.label(locale))
+                    .width(220.0_f32.min(ui.available_width()))
+                    .show_ui(ui, |ui| {
+                        for choice in TranscriptionAuto::ALL {
+                            if theme_option(
+                                ui,
+                                &palette,
+                                choice.label(locale).as_ref(),
+                                choice == selected,
+                            ) {
+                                app.actions.push(Action::SetTranscriptionAuto(choice));
+                            }
+                        }
+                    });
+                theme::reveal_focus(&response.response);
+            },
+        );
+        if app.settings.transcription_auto == crate::settings::TranscriptionAuto::Specific {
+            extensions.block(
+                vec![translated(locale, "Chosen chats")],
+                transcription_chat_picker,
+            );
+        }
+        extensions.block(
+            vec![
+                translated(locale, "Transcription model"),
+                "Whisper".into(),
+                translated(locale, "Download"),
+            ],
+            transcription_models,
+        );
+    }
+
     let mut about_section = Section::new(translated(locale, "About"));
     about_section.block(
         vec![
@@ -798,8 +884,190 @@ fn sections(app: &App) -> Vec<Section> {
         system,
         account_section,
         files,
+        extensions,
         about_section,
     ]
+}
+
+/// The chats transcribed on their own when the scope is specific chats.
+fn transcription_chat_picker(ui: &mut egui::Ui, app: &mut App) {
+    use crate::i18n::gettext;
+    let locale = app.locale;
+    let mut names: Vec<(String, String)> = app
+        .chats
+        .iter()
+        .map(|chat| (chat.id.clone(), chat.name.clone()))
+        .collect();
+    names.sort_by_key(|(_, name)| name.to_lowercase());
+    ui.label(gettext(locale, "Choose the chats").as_ref());
+    egui::ScrollArea::vertical()
+        .id_salt("transcription-chats")
+        .max_height(180.0)
+        .show(ui, |ui| {
+            for (id, name) in names {
+                let mut on = app
+                    .settings
+                    .transcription_chats
+                    .iter()
+                    .any(|chat| chat == &id);
+                if ui.checkbox(&mut on, name).changed() {
+                    // The view only asks; app.rs owns the list.
+                    app.actions
+                        .push(Action::SetTranscriptionChat { chat: id, on });
+                }
+            }
+        });
+}
+
+/// What each Whisper model is good at, shown on hover. The literals live here,
+/// inside their own `gettext` calls, so extraction finds them; a model table
+/// in the transcription module could not be scanned.
+fn model_hint(
+    locale: crate::i18n::Locale,
+    model: &crate::transcription::Model,
+) -> std::borrow::Cow<'static, str> {
+    use crate::i18n::gettext;
+    match model.key {
+        "base" => gettext(
+            locale,
+            "The smallest and the fastest. Accurate only on clear speech.",
+        ),
+        "small" => gettext(locale, "A reasonable everyday choice."),
+        "medium" => gettext(locale, "More detail and a more accurate transcript."),
+        "large" => gettext(
+            locale,
+            "The most detailed. Heavier and slower, with the best quality.",
+        ),
+        "turbo" => gettext(locale, "The most accurate of these, and the slowest."),
+        _ => "".into(),
+    }
+}
+
+/// The Whisper models of the Transcription extension: sizes, download
+/// buttons with progress, and which one the voice messages use.
+fn transcription_models(ui: &mut egui::Ui, app: &mut App) {
+    use crate::i18n::gettext;
+    use crate::transcription::{DownloadState, MODELS};
+    let palette = app.palette;
+    let locale = app.locale;
+    let dir = crate::transcription::models_dir(&app.dirs);
+    let active = crate::transcription::selected_model(&app.settings).map(|model| model.key);
+    ui.vertical(|ui| {
+        ui.label(gettext(locale, "Transcription runs on this computer's processor.").as_ref());
+        ui.add_space(6.0);
+        for model in MODELS.iter() {
+            let downloaded = crate::transcription::model_downloaded(model, &dir);
+            let progress = app.transcriber.download_status(model.key);
+            let downloading = matches!(&progress, Some(DownloadState::Downloading { .. }));
+            let row = ui
+                .horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let dot = if downloaded {
+                        palette.accent
+                    } else {
+                        palette.secondary.gamma_multiply(0.6)
+                    };
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 3.0, dot);
+                    ui.label(model.label);
+                    if model.recommended {
+                        theme::text(
+                            ui,
+                            gettext(locale, "Recommended"),
+                            theme::regular(11.0),
+                            palette.accent,
+                        );
+                    }
+                    theme::text(ui, model.size, theme::regular(11.5), palette.secondary);
+                    if let Some(DownloadState::Downloading { received, total }) = &progress {
+                        let fraction = total
+                            .filter(|total| *total > 0)
+                            .map(|total| *received as f32 / total as f32)
+                            .unwrap_or(0.0);
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .desired_height(14.0)
+                                .desired_width(120.0)
+                                .text(format!("{:.0}%", fraction * 100.0))
+                                .corner_radius(7.0),
+                        );
+                    }
+                    // Every action sits in the same column at the row's end.
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if active == Some(model.key) {
+                            theme::soft_button(
+                                ui,
+                                &palette,
+                                None,
+                                &gettext(locale, "Active"),
+                                true,
+                            );
+                        } else if downloaded {
+                            if theme::soft_button(
+                                ui,
+                                &palette,
+                                Some(Icon::Check),
+                                &gettext(locale, "Use"),
+                                false,
+                            )
+                            .clicked()
+                            {
+                                app.actions.push(Action::SetTranscriptionModel(model.key));
+                            }
+                        } else if downloading {
+                            if theme::soft_button(
+                                ui,
+                                &palette,
+                                Some(Icon::X),
+                                &gettext(locale, "Cancel"),
+                                false,
+                            )
+                            .clicked()
+                            {
+                                app.actions
+                                    .push(Action::CancelTranscriptionDownload(model.key));
+                            }
+                        } else if theme::soft_button(
+                            ui,
+                            &palette,
+                            Some(Icon::Download),
+                            &gettext(locale, "Download"),
+                            false,
+                        )
+                        .clicked()
+                        {
+                            app.actions
+                                .push(Action::DownloadTranscriptionModel(model.key));
+                        }
+                        if downloaded
+                            && theme::icon_button(
+                                ui,
+                                Icon::Trash,
+                                14.0,
+                                palette.secondary,
+                                palette.danger,
+                                &gettext(locale, "Delete model"),
+                            )
+                            .clicked()
+                        {
+                            app.actions
+                                .push(Action::DeleteTranscriptionModel(model.key));
+                        }
+                    });
+                })
+                .response;
+            row.on_hover_text(model_hint(locale, model));
+            if let Some(DownloadState::Failed(error)) = &progress {
+                theme::text(
+                    ui,
+                    format!("{}: {error}", gettext(locale, "Download failed")),
+                    theme::regular(11.5),
+                    palette.danger,
+                );
+            }
+            ui.add_space(2.0);
+        }
+    });
 }
 
 /// The app lock: a password, how long ZapFast may go unused, and the form
