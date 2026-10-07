@@ -49,6 +49,11 @@ RAM, compared with 1.13 GB for WhatsApp Web and its Chromium processes.
   optional app lock hides the whole window behind a password.
 - **Copies message text.** Select part of a message or copy across messages
   with the time, date, and sender included.
+- **Transcribes voice messages locally.** A Whisper model you download once
+  runs on this computer's processor and turns voice messages into text inside
+  the bubble. Audio and text never leave the machine, and the transcript is
+  never written to the archive.
+  [Settings, models and disk use](/settings-and-files/#transcription).
 
 ## What it does not do yet
 

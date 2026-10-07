@@ -35,8 +35,8 @@ source build has no launcher integration.
 
 The build needs a C/C++ toolchain, CMake, and Perl (for the bundled
 OpenSSL); `rust-toolchain.toml` pins the Rust version. On Linux it also needs
-egui's development libraries and ALSA. libopus and the H.264 decoder build
-from source. On Arch Linux:
+egui's development libraries and ALSA. libopus, the H.264 decoder, and the
+Whisper speech-to-text engine build from source. On Arch Linux:
 
 ```sh
 sudo pacman -S --needed alsa-lib libxkbcommon wayland cmake perl

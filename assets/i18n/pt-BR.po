@@ -1614,3 +1614,133 @@ msgstr ""
 #, rust-format
 msgid "{count} unread chats"
 msgstr ""
+
+#: src/ui/settings.rs
+msgid "Extensions"
+msgstr "Extensões"
+
+#: src/ui/settings.rs
+msgid "Local transcription"
+msgstr "Transcrição local"
+
+#: src/ui/settings.rs
+msgid ""
+"Transcribe voice messages on this computer with Whisper. Audio and text "
+"never leave it."
+msgstr ""
+"Transcreve mensagens de voz neste computador com o Whisper. Áudio e texto "
+"nunca saem dele."
+
+#: src/ui/settings.rs
+msgid "Transcription language"
+msgstr "Idioma da transcrição"
+
+#: src/ui/settings.rs
+msgid "Portuguese, or let the model detect the language."
+msgstr "Português, ou deixar o modelo detectar o idioma."
+
+#: src/ui/settings.rs
+msgid "Portuguese"
+msgstr "Português"
+
+#: src/ui/settings.rs
+msgid "Detect language"
+msgstr "Detectar idioma"
+
+#: src/ui/settings.rs
+msgid "Transcription model"
+msgstr "Modelo de transcrição"
+
+#: src/ui/settings.rs
+msgid "Download"
+msgstr "Baixar"
+
+#: src/ui/settings.rs
+msgid "Active"
+msgstr "Ativo"
+
+#: src/ui/settings.rs
+msgid "Use"
+msgstr "Usar"
+
+#: src/ui/settings.rs
+msgid "Download failed"
+msgstr "Falha no download"
+
+#: src/ui/conversation.rs
+msgid "Transcribe"
+msgstr "Transcrever"
+
+#: src/ui/conversation.rs
+msgid "Transcribing"
+msgstr "Transcrevendo"
+
+#: src/ui/conversation.rs
+msgid "Transcription failed"
+msgstr "Falha na transcrição"
+
+#: src/ui/conversation.rs
+msgid "Click the keyboard to retry"
+msgstr "Clique no teclado para tentar de novo"
+
+#: src/ui/conversation.rs
+msgid "Transcribed on this computer"
+msgstr "Transcrito neste computador"
+
+#: src/ui/conversation.rs
+msgid "Copy transcript"
+msgstr "Copiar transcrição"
+
+msgid "GPU acceleration"
+msgstr "Aceleração por GPU"
+
+msgid "NVIDIA cards, about 1.2 GB. Other computers stay on the CPU."
+msgstr "Placas NVIDIA, cerca de 1,2 GB. Nos outros computadores continua na CPU."
+
+msgid "Install"
+msgstr "Instalar"
+
+msgid "The smallest and the fastest. Accurate only on clear speech."
+msgstr "O menor e o mais rápido. Preciso só com fala clara."
+
+msgid "A reasonable everyday choice."
+msgstr "Uma escolha razoável para o dia a dia."
+
+msgid "More detail and a more accurate transcript."
+msgstr "Mais detalhes e uma transcrição mais precisa."
+
+msgid "The most detailed. Heavier and slower, with the best quality."
+msgstr "O mais detalhado. Mais pesado e mais lento, com a melhor qualidade."
+
+msgid "The most accurate of these, and the slowest."
+msgstr "O mais preciso destes, e o mais lento."
+
+msgid "Recommended"
+msgstr "Recomendado"
+
+msgid "Delete model"
+msgstr "Excluir modelo"
+
+msgid "Transcribe automatically"
+msgstr "Transcrever automaticamente"
+
+msgid "Voice messages in the chosen chats are transcribed as they arrive."
+msgstr "As mensagens de voz das conversas escolhidas são transcritas quando chegam."
+
+msgid "Off"
+msgstr "Desligado"
+
+msgid "Pinned chats"
+msgstr "Conversas fixadas"
+
+msgid "Personal chats"
+msgstr "Conversas pessoais"
+
+msgid "Everything, groups included"
+msgstr "Tudo, inclusive grupos"
+
+msgid "Chosen chats"
+msgstr "Conversas escolhidas"
+
+msgid "Choose the chats"
+msgstr "Escolha as conversas"

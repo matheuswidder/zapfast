@@ -18,6 +18,7 @@ On Linux:
 | Message archive | `~/.local/state/zapfast/accounts/<id>/archive.db` | Encrypted; the only copy of history WhatsApp will not send again |
 | Per-number settings | `~/.local/state/zapfast/accounts/<id>/settings.json` | Notifications, receipts, typing, automatic downloads, the last open chat, and the wallpaper |
 | Stickers and packs | `~/.local/state/zapfast/accounts/<id>/stickers/` | Plain WebP files; each pack is a folder |
+| Transcription models | `~/.local/state/zapfast/models/` | Whisper models, 141 MB to 3 GB each; removed by the trash button in Settings, never by clearing the cache |
 | Wallpaper image | `~/.local/state/zapfast/accounts/<id>/wallpaper.jpg` | Copy of the chosen picture (or `.png`, `.webp`, `.gif`) |
 | Attachments, avatars | `~/.cache/zapfast/accounts/<id>/` | Safe to delete; available files download again when viewed |
 | Last run's log | `~/.local/state/zapfast/zapfast.log` | `--verbose` for more |
@@ -178,6 +179,56 @@ collapses it to a column of avatars with unread badges.
 Settings from earlier versions that no longer exist are ignored and dropped
 the next time settings are saved. The two earlier media pause switches become
 the one above: it stays on only if both were on.
+
+## Transcription
+
+**Settings > Extensions > Local transcription** reads voice messages on this
+computer with a Whisper model. Turn it on, download one of the models, and a
+small keyboard button appears on every audio bubble; the transcript shows
+inside the bubble. Nothing is sent anywhere: the audio goes to the model and
+the text comes back.
+
+| Model | Size | Notes |
+| --- | --- | --- |
+| Base | 141 MB | The lightest that still transcribes well |
+| Small | 466 MB | Recommended for everyday voice messages |
+| Medium | 1.5 GB | More detail and a more accurate transcript |
+| Large | 3 GB | The most detailed, heaviest and slowest |
+| Turbo | 1.6 GB | The balance of speed and quality |
+
+Model names, sizes and sizes on disk come from the Whisper ggml
+distributions. Smaller is not always worse: Turbo is built from a newer
+generation than Small and transcribes more accurately, at several times the
+cost in time.
+
+Models download from Hugging Face into the state folder, never the cache, so
+clearing the cache keeps them. A download can be cancelled, and the trash
+button next to a downloaded model removes it to free that disk space. Only one
+model is used at a time; switching models discards the transcripts already on
+screen, because they came from the old one.
+
+Transcription runs on the processor, one message at a time on its own thread,
+so the window stays responsive throughout. Speed depends on the model and the
+computer. As a rough guide on a recent laptop processor, transcribing a
+13-second clip takes about 2 seconds with Base, about 8 with Small, and about
+25 with Turbo — Turbo is roughly twice slower than real time, so a long
+message can take a while. The larger models are much more accurate, and Base
+is fast enough to be unusable on anything but the clearest speech. Pick the
+smallest model that gives you a transcript you can trust.
+
+**Transcribe automatically** chooses which chats are transcribed without a
+click: nothing, pinned chats, one-to-one chats, every chat including groups,
+or a list of chats you pick. Voice messages that arrive before a model has
+finished downloading are transcribed once it lands, as long as the chat is
+still covered by the scope.
+
+Transcripts live in memory for the session. They are never written to the
+archive, never synced, and are gone when ZapFast closes.
+
+**Network access.** ZapFast contacts `huggingface.co` for model files, and
+GitHub for update checks and releases. The transcription extension adds
+nothing else: no message content, phone number, key, or QR payload is ever
+sent, and the model runs offline once downloaded.
 
 ## App lock
 

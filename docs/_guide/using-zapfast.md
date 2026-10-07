@@ -261,6 +261,19 @@ microphone. Press Enter or the send button to send the recording, or Escape or
 the delete button to discard it. ZapFast raises the volume of quiet recordings.
 Starting a reply before recording includes the quoted message.
 
+With **Settings > Extensions > Local transcription** on and a Whisper model
+downloaded, a small keyboard button sits in the corner of the play button on
+every audio bubble. Click it and the transcript appears inside the bubble,
+under the player, with a copy button beside it and the time on the same last
+line. The bubble keeps the player's width however long the text is; it wraps
+downward instead. Transcription runs on this computer, so the recording is
+never sent anywhere, and the transcript lasts for this session only.
+
+**Transcribe automatically** does the same for whole chats without a click:
+pinned chats, one-to-one chats, every chat including groups, or a list you
+choose. Messages that arrive before the first model finishes downloading are
+transcribed once it lands, as long as the chat is still in scope.
+
 ## Copying
 
 Select and copy any message text. A selection across messages uses WhatsApp's
