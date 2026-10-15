@@ -7180,6 +7180,12 @@ impl App {
                 // Transcripts on screen came from whichever engine was live;
                 // switching engines deserves fresh words.
                 self.transcriber.forget_all();
+                if on && !crate::transcription::gpu_ready(&self.dirs) {
+                    // Turning the switch on without the runtime fetches it, as
+                    // turning the extension on fetches a model's picker's row.
+                    self.transcriber
+                        .download_gpu(self.dirs.clone(), self.waker.clone());
+                }
                 self.mark_settings_dirty();
             }
             Action::DownloadTranscriptionGpu => {

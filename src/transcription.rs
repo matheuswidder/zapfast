@@ -251,10 +251,23 @@ impl Transcriber {
                         .insert(job.message.clone(), TranscribeState::Running);
                     worker_revision.fetch_add(1, Ordering::Relaxed);
                     waker.wake();
-                    let result = match &job.gpu {
-                        Some(cli) if cli.is_file() => transcribe_external(&job, cli),
-                        _ => transcribe(&job, &mut loaded),
+                    let started = std::time::Instant::now();
+                    let engine = match &job.gpu {
+                        Some(cli) if cli.is_file() => {
+                            log::info!("[TRANSCRIBE] job via whisper-cli (GPU)");
+                            transcribe_external(&job, cli)
+                        }
+                        _ => {
+                            log::info!("[TRANSCRIBE] job via in-process model (CPU)");
+                            transcribe(&job, &mut loaded)
+                        }
                     };
+                    log::info!(
+                        "[TRANSCRIBE] {} in {:.1}s",
+                        if engine.is_ok() { "done" } else { "failed" },
+                        started.elapsed().as_secs_f32()
+                    );
+                    let result = engine;
                     let mut states = worker_states.lock().unwrap_or_else(|p| p.into_inner());
                     states.insert(
                         job.message,
@@ -632,11 +645,15 @@ fn transcribe_external(job: &Job, cli: &Path) -> Result<String, String> {
         crate::util::now()
     ));
     write_wav(&wav, &samples).map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
     let text = (|| {
         let mut args: Vec<std::ffi::OsString> = vec![
             "--model".into(),
             job.model.clone().into_os_string(),
+            // Bare transcript lines, no `[00:00 --> 00:03]` prefixes and no
+            // progress chatter: what stdout carries is the words.
             "--no-prints".into(),
+            "--no-timestamps".into(),
         ];
         if let Some(language) = &job.language {
             args.push("--language".into());
@@ -660,11 +677,22 @@ fn transcribe_external(job: &Job, cli: &Path) -> Result<String, String> {
             .output()
             .map_err(|error| format!("whisper-cli: {error}"))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = stderr.lines().last().unwrap_or("").trim();
             return Err(format!(
-                "whisper-cli exited with {}",
-                output.status.code().unwrap_or(-1)
+                "whisper-cli exited with {}{}",
+                output.status.code().unwrap_or(-1),
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {reason}")
+                }
             ));
         }
+        log::info!(
+            "[TRANSCRIBE] gpu whisper-cli finished in {:.1}s",
+            started.elapsed().as_secs_f32()
+        );
         let text = String::from_utf8_lossy(&output.stdout);
         // The CLI prints processing marks such as `[BLANK_AUDIO]`; those are
         // not part of the words.
