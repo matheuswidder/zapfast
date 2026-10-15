@@ -11,6 +11,7 @@ use egui::{
 
 use crate::animation;
 use crate::app::{App, Conversation, JumpHighlight, KeyScroll, RowHeight};
+use crate::geo::Spot;
 use crate::markup;
 use crate::model::{
     Action, Chat, ChatId, Content, Delivery, Dialog, LinkPreview, Media, MediaState, Message,
@@ -19,14 +20,37 @@ use crate::model::{
 use crate::theme::{self, Icon, Palette};
 use crate::wallpaper;
 
-use super::focus::{Stop, TabStop};
+use super::focus::{self, Stop, TabStop};
 use super::widgets;
 
 /// Group-message avatar size.
 const SENDER_AVATAR: f32 = 28.0;
-const BODY_SIZE: f32 = 14.5;
-/// Extra space above the first message of a run from one side.
+const BODY_SIZE: f32 = widgets::MESSAGE_TEXT_SIZE;
+/// Extra space above the first message of a run from one side. With the
+/// list's 3 points between rows, runs stand 8 points apart and a run's
+/// bubbles 3, Messages' own spacing on the Mac
+/// (`CKUIBehaviorMac.balloonNonContiguousSpace` and
+/// `balloonContiguousSpace`).
 const RUN_GAP: f32 = 5.0;
+/// How much of the transcript's width a bubble may take in the Messages
+/// style (`CKUIBehaviorMac.balloonMaxWidthPercent`), and in WhatsApp's.
+const MESSAGES_WIDTH_SHARE: f32 = 0.65;
+const WHATSAPP_WIDTH_SHARE: f32 = 0.72;
+/// The transcript's side margin in the Messages style: Messages' 11 points
+/// (`CKUIBehaviorMac.minTranscriptMarginInsets`) plus the 5 points beside
+/// each balloon's body that its tail curls into, at ZapFast's text size.
+const MESSAGES_SIDE_MARGIN: i8 = 17;
+/// The transcript's side margin in WhatsApp's style.
+const WHATSAPP_SIDE_MARGIN: i8 = 18;
+/// Room around a Messages bubble's contents: Messages' 12 points beside its
+/// text and 7 above and below (`CKUIBehaviorMac.textBalloonPillContentInsets`)
+/// at ZapFast's text size, 13.4 and 7.8, rounded.
+const MESSAGES_BUBBLE_MARGIN: Margin = Margin {
+    left: 13,
+    right: 13,
+    top: 8,
+    bottom: 8,
+};
 /// The side of a selecting row's check box, and the column that holds it.
 const SELECT_BOX: f32 = 18.0;
 const SELECT_GUTTER: f32 = SELECT_BOX + 14.0;
@@ -37,19 +61,53 @@ const NOT_SENT_HINT: &str =
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let Some(chat) = app.current_chat().cloned() else {
-        if theme::macos_chrome(ui.ctx()) {
+        if theme::chrome_in_headers(ui.ctx()) {
             super::banner(app, ui);
         }
         empty(app, ui);
         return;
     };
     wallpaper::paint(ui, &app.wallpaper());
+    // On a vibrant window the messages scroll on under the header, as in
+    // Messages: the header and any banner go on a layer above them.
+    if app.palette.vibrant() {
+        let layer = egui::LayerId::new(egui::Order::Middle, ui.id().with("chat-header"));
+        let bar = ui
+            .scope_builder(egui::UiBuilder::new().layer_id(layer), |ui| {
+                // Beneath the header: the messages under it, frosted, and a
+                // veil of the chat's colour that keeps the title readable.
+                let glass = ui.painter().add(egui::Shape::Noop);
+                let veil = ui.painter().add(egui::Shape::Noop);
+                header(app, ui, &chat);
+                if theme::chrome_in_headers(ui.ctx()) {
+                    super::banner(app, ui);
+                }
+                let bar = ui.min_rect();
+                // Strongest at the top, both ease off from within the bar to
+                // a little below it, so where they start never shows.
+                let frosted = bar.with_max_y(bar.bottom() + HEADER_TAIL);
+                let ease = HEADER_TAIL + bar.height() * HEADER_EASE;
+                ui.painter().set(glass, super::glass::shape(frosted, ease));
+                ui.painter()
+                    .set(veil, header_veil(&app.palette, frosted, ease));
+                bar
+            })
+            .inner;
+        composer(app, ui, &chat);
+        let list = ui.available_rect_before_wrap().with_min_y(bar.top());
+        ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
+            messages(app, ui, &chat, bar.height());
+        });
+        // A vibrant window is flat, as Messages is: no shadows over the chat.
+        return;
+    }
     let header = header(app, ui, &chat);
-    if theme::macos_chrome(ui.ctx()) {
+    if theme::chrome_in_headers(ui.ctx()) {
         super::banner(app, ui);
     }
+    pin_banner(app, ui, &chat);
     composer(app, ui, &chat);
-    messages(app, ui, &chat);
+    messages(app, ui, &chat, 0.0);
     // Over the messages, which scroll under the header.
     widgets::paint_shadow_below(
         ui,
@@ -70,6 +128,147 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.max_rect().bottom(),
         );
     }
+}
+
+/// Height of the pinned-message line under the header. It is one line
+/// whatever the number of pins, as on WhatsApp: it shows one pin at a time.
+const PIN_ROW_HEIGHT: f32 = 44.0;
+/// Gap between the banner edge and the pin count bar, and the icon's own box.
+const PIN_ROW_INSET: f32 = 12.0;
+const PIN_ICON: f32 = 16.0;
+/// The bar at the line's left edge: one segment per pin, the shown one lit.
+const PIN_BAR_WIDTH: f32 = 3.0;
+const PIN_BAR_GAP: f32 = 2.0;
+
+/// Which pin the line shows: the one it showed last, or the newest pin when
+/// that one is gone. `rows` is newest first.
+fn shown_pin(rows: &[crate::archive::Pinned], cursor: Option<&str>) -> usize {
+    cursor
+        .and_then(|id| rows.iter().position(|row| row.id == id))
+        .unwrap_or(0)
+}
+
+/// The pin a click leaves on the line: the next older one, back to the
+/// newest after the oldest, so repeated clicks walk every pin.
+fn next_pin(rows: usize, shown: usize) -> usize {
+    if rows == 0 { 0 } else { (shown + 1) % rows }
+}
+
+/// Where each segment of the pin count bar goes, top to bottom, for `count`
+/// pins in a bar `height` tall. The newest pin is the bottom segment, as on
+/// WhatsApp.
+fn pin_bar_segments(top: f32, height: f32, count: usize) -> Vec<(f32, f32)> {
+    let count = count.max(1);
+    let gaps = PIN_BAR_GAP * (count - 1) as f32;
+    let segment = ((height - gaps) / count as f32).max(1.0);
+    (0..count)
+        .map(|index| {
+            let start = top + (segment + PIN_BAR_GAP) * index as f32;
+            (start, start + segment)
+        })
+        .collect()
+}
+
+/// The chat's pinned messages under its header, one line like WhatsApp's: it
+/// shows one pin, the newest first, with the message's own words cut off with
+/// an ellipsis when they do not fit. Clicking it opens that message and moves
+/// the line on to the next pin, so repeated clicks walk the chat's pins. A bar
+/// at its left has a segment per pin and lights the one shown.
+fn pin_banner(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
+    let now = crate::util::now();
+    if let Some(wait) = app.chat_pins.get(&chat.id).and_then(|rows| {
+        rows.iter()
+            .filter(|row| row.expires_at > now)
+            .map(|row| row.expires_at)
+            .min()
+    }) {
+        let left = wait.saturating_sub(now).clamp(0, 86_400) as u64;
+        ui.ctx()
+            .request_repaint_after(Duration::from_secs(left.saturating_add(1)));
+    }
+    let rows = live_pins(
+        app.chat_pins.get(&chat.id).map_or(&[][..], Vec::as_slice),
+        now,
+    );
+    if rows.is_empty() {
+        return;
+    }
+    // Which pin is shown is the view's own state, kept per chat.
+    let cursor_id = pin_cursor_id(&chat.id);
+    let cursor = ui.ctx().data(|data| data.get_temp::<String>(cursor_id));
+    let shown = shown_pin(&rows, cursor.as_deref());
+    let row = &rows[shown];
+    let palette = app.palette;
+    let (bar, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), PIN_ROW_HEIGHT), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    ui.painter().rect_filled(
+        bar,
+        0.0,
+        if response.hovered() {
+            palette.surface_hover
+        } else {
+            palette.panel
+        },
+    );
+    // Newest pin at the bottom, so the bar fills upward as pins are added.
+    let segments = pin_bar_segments(bar.top() + 8.0, bar.height() - 16.0, rows.len());
+    let left = bar.left() + PIN_ROW_INSET;
+    for (index, (top, bottom)) in segments.iter().enumerate() {
+        let pin = rows.len() - 1 - index;
+        let colour = if pin == shown {
+            palette.accent
+        } else {
+            palette.dim
+        };
+        ui.painter().rect_filled(
+            Rect::from_x_y_ranges(left..=left + PIN_BAR_WIDTH, *top..=*bottom),
+            PIN_BAR_WIDTH / 2.0,
+            colour,
+        );
+    }
+    let icon_left = left + PIN_BAR_WIDTH + 10.0;
+    let icon = Rect::from_center_size(
+        pos2(icon_left + PIN_ICON / 2.0, bar.center().y),
+        Vec2::splat(PIN_ICON),
+    );
+    theme::paint_icon(ui, Icon::Pin, icon, 14.0, palette.accent);
+    let text_left = icon_left + PIN_ICON + 8.0;
+    let text_width = (bar.right() - PIN_ROW_INSET - text_left).max(1.0);
+    let label = widgets::line(
+        ui,
+        &crate::markup::plain(&app.resolve_mention_tokens(&row.text), &[]),
+        theme::regular(13.0),
+        palette.text,
+        text_width,
+        1,
+    );
+    label.paint(
+        ui,
+        pos2(text_left, bar.center().y - label.size().y / 2.0),
+        palette.text,
+    );
+    theme::reveal_focus(&response);
+    let described = crate::i18n::gettext(app.locale, "Pinned message {index} of {count}: {text}")
+        .replace("{index}", &(shown + 1).to_string())
+        .replace("{count}", &rows.len().to_string())
+        .replace("{text}", &row.text);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &described)
+    });
+    if response.clicked() {
+        app.actions.push(Action::OpenMessage {
+            chat: chat.id.clone(),
+            message: row.id.clone(),
+        });
+        let next = rows[next_pin(rows.len(), shown)].id.clone();
+        ui.ctx().data_mut(|data| data.insert_temp(cursor_id, next));
+    }
+}
+
+/// Where the pin line keeps the id of the pin it shows, per chat.
+fn pin_cursor_id(chat: &str) -> egui::Id {
+    egui::Id::new(("pin-cursor", chat))
 }
 
 fn empty(app: &mut App, ui: &mut egui::Ui) {
@@ -115,6 +314,84 @@ fn empty(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// The share of a vibrant header, from its bottom, over which its frost and
+/// veil begin to ease off.
+const HEADER_EASE: f32 = 0.35;
+/// How far below a vibrant header its frost and veil carry on, easing off.
+const HEADER_TAIL: f32 = 24.0;
+/// Rows of the veil's ease, enough for its curve to look smooth.
+const VEIL_STEPS: usize = 8;
+
+/// The veil over a vibrant header's frost: the palette's at the top, then
+/// easing to nothing over the bottom `ease` points of `rect` along the same
+/// curve as the frost, so the messages under it never stop at a line.
+fn header_veil(palette: &Palette, rect: Rect, ease: f32) -> egui::Shape {
+    let top = palette.vibrant_header(palette.chat);
+    let start = rect.bottom() - ease;
+    let mut mesh = egui::Mesh::default();
+    let mut row = |y: f32, color: Color32| {
+        mesh.colored_vertex(pos2(rect.left(), y), color);
+        mesh.colored_vertex(pos2(rect.right(), y), color);
+    };
+    row(rect.top(), top);
+    for step in 0..=VEIL_STEPS {
+        let t = step as f32 / VEIL_STEPS as f32;
+        // smoothstep, as the frost's shader eases.
+        let strength = 1.0 - t * t * (3.0 - 2.0 * t);
+        row(start + ease * t, top.gamma_multiply(strength));
+    }
+    let rows = mesh.vertices.len() as u32 / 2;
+    for row in 0..rows - 1 {
+        let at = row * 2;
+        mesh.add_triangle(at, at + 1, at + 3);
+        mesh.add_triangle(at, at + 3, at + 2);
+    }
+    egui::Shape::mesh(mesh)
+}
+
+/// How round the glass under a vibrant header's name is: straight-sided,
+/// leaving room around the text, rather than a capsule.
+const NAME_GLASS_RADIUS: f32 = 12.0;
+/// The room around the name and status on their glass: wide at the sides,
+/// and little above, so the glass keeps clear of the window's top edge.
+const NAME_GLASS_PADDING: Vec2 = vec2(14.0, 3.5);
+/// The room above and below a name alone on its glass.
+const NAME_GLASS_SINGLE: f32 = 7.0;
+/// How tall the name and status stand together on glass: less than the
+/// avatar, so the two lines sit a little closer around its middle.
+const NAME_GLASS_LINES: f32 = 32.0;
+/// How wide the round glass under each of a vibrant header's buttons is.
+const BUTTON_GLASS: f32 = 36.0;
+/// The space between two of a vibrant header's buttons, beyond their glass.
+const BUTTON_GAP: f32 = 10.0;
+/// What the chat header needs beside the caption buttons ZapFast draws: its
+/// most buttons (Back, two calls, Search and More), the avatar, and a name.
+const HEADER_MIN_CONTENT: f32 = 320.0;
+
+/// The round glass under one of a vibrant header's buttons.
+fn glass_button(palette: &Palette, button: Rect) -> egui::Shape {
+    glass(
+        palette,
+        Rect::from_center_size(button.center(), Vec2::splat(BUTTON_GLASS)),
+        BUTTON_GLASS / 2.0,
+    )
+}
+
+/// Glass under a vibrant header's name or one of its buttons: the veil
+/// thickened where they sit, with a faint edge, as Messages floats them.
+fn glass(palette: &Palette, rect: Rect, radius: f32) -> egui::Shape {
+    let radius = CornerRadius::from(radius);
+    egui::Shape::Vec(vec![
+        egui::Shape::rect_filled(rect, radius, palette.vibrant_pill(palette.chat)),
+        egui::Shape::rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, palette.text.gamma_multiply(0.08)),
+            egui::StrokeKind::Inside,
+        ),
+    ])
+}
+
 fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
     let palette = app.palette;
     let title = app.chat_title(chat);
@@ -122,14 +399,24 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
         .show_separator_line(false)
         .frame(
             Frame::new()
-                .fill(palette.panel)
+                // On a vibrant window the messages scroll on under it,
+                // frosted, with the veil drawn beneath the header instead.
+                .fill(if palette.vibrant() {
+                    Color32::TRANSPARENT
+                } else {
+                    palette.panel
+                })
                 .inner_margin(Margin::symmetric(14, 8)),
         )
         .show(ui, |ui| {
             // The chat list, expanded or collapsed, clears the traffic lights.
-            if theme::macos_chrome(ui.ctx()) {
+            if theme::chrome_in_headers(ui.ctx()) {
                 super::titlebar_drag(ui, ui.max_rect());
             }
+            // The caption buttons ZapFast draws over a corner the header
+            // reaches: beside its own buttons, or above them when narrow.
+            let room = super::caption_room(ui.ctx(), ui.max_rect(), HEADER_MIN_CONTENT);
+            ui.add_space(room.top);
             let narrow = super::narrow(ui.ctx());
             let row = ui.horizontal(|ui| {
                 // Give both rows a fixed height so their contents align.
@@ -138,11 +425,37 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                 // lights itself.
                 if narrow && theme::macos_chrome(ui.ctx()) {
                     ui.add_space(theme::traffic_light_inset(ui.ctx()));
+                } else if app.sidebar_mode() == crate::model::SidebarDisplayMode::CollapsedIconsOnly
+                    && app.page == crate::model::Page::Chats
+                {
+                    // Beside the rail alone, the lights reach over this header.
+                    ui.add_space(super::rail::lights_overhang(ui.ctx()));
                 }
+                ui.add_space(room.left);
                 let picture = app.avatar(&chat.id);
                 let (subtitle, color) = subtitle(app, chat);
-                // More and Search, and Back in a narrow window.
-                let right_controls = if narrow { 108.0 } else { 72.0 };
+                let call_here = app.call_live_here(&chat.id);
+                // More and Search, and Back in a narrow window, and the call
+                // buttons in a one-to-one chat, each on its own glass with
+                // room around it on a vibrant window.
+                let call_buttons = if chat.kind == crate::model::ChatKind::Direct
+                    && app.me.as_deref() != Some(chat.id.as_str())
+                {
+                    if call_here { 1.0 } else { 2.0 }
+                } else {
+                    0.0
+                };
+                let buttons = if narrow { 3.0 } else { 2.0 } + call_buttons;
+                let right_controls = if palette.vibrant() {
+                    buttons * 36.0 + (buttons - 0.5) * BUTTON_GAP + (BUTTON_GLASS - 30.0)
+                } else {
+                    buttons * 36.0
+                } + room.right;
+                // On a vibrant window the name and the buttons sit on glass
+                // pills, drawn beneath them once they are measured.
+                let name_pill = ui.painter().add(egui::Shape::Noop);
+                let mut text = Rect::NOTHING;
+                let mut avatar = Rect::NOTHING;
                 // Treat the avatar, name, and subtitle as one info button.
                 let block = ui
                     .scope(|ui| {
@@ -162,51 +475,92 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                     40.0,
                                     picture.as_deref(),
                                 );
-                                if chat.ephemeral_expiration.is_some() {
+                                avatar = avatar_response.rect;
+                                if chat.disappearing_timer().is_some() {
                                     widgets::paint_disappearing_badge(
                                         ui,
                                         &palette,
                                         avatar_response.rect,
                                     );
                                 }
-                                ui.add_space(4.0);
+                                // Room for the name's glass pill to clear the avatar.
+                                ui.add_space(if palette.vibrant() { 14.0 } else { 4.0 });
                                 ui.vertical(|ui| {
                                     let width = (ui.available_width() - right_controls).max(80.0);
                                     ui.set_max_width(width);
+                                    // On glass the lines centre on the avatar: the
+                                    // column starts at the row's top otherwise.
+                                    if palette.vibrant() {
+                                        let column = if subtitle.is_empty() {
+                                            40.0
+                                        } else {
+                                            NAME_GLASS_LINES
+                                        };
+                                        let top = avatar.center().y - column / 2.0;
+                                        ui.add_space((top - ui.cursor().top()).max(0.0));
+                                    }
                                     if subtitle.is_empty() {
                                         // Center the name on the avatar.
                                         ui.allocate_ui_with_layout(
                                             vec2(width, 40.0),
                                             Layout::left_to_right(Align::Center),
                                             |ui| {
-                                                widgets::rich_text(
+                                                text = widgets::rich_text(
                                                     ui,
                                                     &title,
-                                                    theme::semibold(17.0),
+                                                    // Lighter on glass, as Apple's.
+                                                    if palette.vibrant() {
+                                                        theme::medium(15.0)
+                                                    } else {
+                                                        theme::semibold(17.0)
+                                                    },
                                                     palette.text,
-                                                );
+                                                )
+                                                .rect;
                                             },
                                         );
                                     } else {
-                                        // Align the name and subtitle with the avatar edges.
+                                        // Align the name and subtitle with the avatar edges,
+                                        // or on glass a little closer, around its middle.
                                         ui.allocate_ui_with_layout(
-                                            vec2(width, 40.0),
+                                            vec2(
+                                                width,
+                                                if palette.vibrant() {
+                                                    NAME_GLASS_LINES
+                                                } else {
+                                                    40.0
+                                                },
+                                            ),
                                             Layout::top_down(Align::Min),
                                             |ui| {
-                                                widgets::rich_text(
+                                                text = widgets::rich_text(
                                                     ui,
                                                     &title,
-                                                    theme::semibold(15.0),
+                                                    theme::semibold(if palette.vibrant() {
+                                                        14.0
+                                                    } else {
+                                                        15.0
+                                                    }),
                                                     palette.text,
-                                                );
+                                                )
+                                                .rect;
                                                 ui.with_layout(
                                                     Layout::bottom_up(Align::Min),
                                                     |ui| {
-                                                        widgets::rich_text(
-                                                            ui,
-                                                            &subtitle,
-                                                            theme::regular(12.5),
-                                                            color,
+                                                        text = text.union(
+                                                            widgets::rich_text(
+                                                                ui,
+                                                                &subtitle,
+                                                                theme::regular(
+                                                                    if palette.vibrant() {
+                                                                        11.5
+                                                                    } else {
+                                                                        12.5
+                                                                    },
+                                                                ),
+                                                                color,
+                                                            )
+                                                            .rect,
                                                         );
                                                     },
                                                 );
@@ -218,12 +572,30 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                         );
                     })
                     .response;
+                if palette.vibrant() && text.is_positive() {
+                    // A lone name gets Apple's roomier padding.
+                    let padding = vec2(
+                        NAME_GLASS_PADDING.x,
+                        if subtitle.is_empty() {
+                            NAME_GLASS_SINGLE
+                        } else {
+                            NAME_GLASS_PADDING.y
+                        },
+                    );
+                    // Centred on the avatar, whatever room the lines leave
+                    // above and below their glyphs.
+                    let glass_rect = Rect::from_center_size(
+                        pos2(text.center().x, avatar.center().y),
+                        text.size() + 2.0 * padding,
+                    );
+                    ui.painter()
+                        .set(name_pill, glass(&palette, glass_rect, NAME_GLASS_RADIUS));
+                }
                 let block = ui
                     .interact(block.rect, ui.id().with("chat-header-info"), Sense::click())
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if block.clicked() {
-                    app.actions
-                        .push(Action::ShowDialog(Dialog::ChatInfo(chat.id.clone())));
+                    app.actions.push(Action::OpenInfo(chat.id.clone()));
                 }
                 // The item and the width that has to hold it are measured from
                 // the same localized label: a translation wider than the
@@ -235,6 +607,13 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                 };
                 let select_messages_label = crate::i18n::gettext(app.locale, "Select messages");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(room.right);
+                    // Each button on a vibrant window floats on its own glass,
+                    // with room around it.
+                    if palette.vibrant() {
+                        ui.add_space(BUTTON_GAP / 2.0);
+                    }
+                    let more_glass = ui.painter().add(egui::Shape::Noop);
                     let more = theme::icon_button(
                         ui,
                         Icon::Ellipsis,
@@ -243,6 +622,10 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                         palette.text,
                         "More",
                     );
+                    if palette.vibrant() {
+                        ui.painter()
+                            .set(more_glass, glass_button(&palette, more.rect));
+                    }
                     let width = widgets::menu_width(
                         ui,
                         &[
@@ -267,8 +650,7 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                         .frame(widgets::menu_frame(&palette))
                         .show(|ui| {
                             if widgets::menu_item(ui, &palette, Some(Icon::Info), "Info") {
-                                app.actions
-                                    .push(Action::ShowDialog(Dialog::ChatInfo(chat.id.clone())));
+                                app.actions.push(Action::OpenInfo(chat.id.clone()));
                             }
                             if widgets::menu_item(
                                 ui,
@@ -337,13 +719,80 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                 app.actions.push(Action::CloseChat);
                             }
                         });
+                    // Calls are one to one: a group, a channel, a broadcast
+                    // list and the chat with ourselves have no call button.
+                    // While this chat has the call, the button ends it.
+                    if call_buttons > 0.0 {
+                        let (call_tooltip, call_icon, call_fill, call) = if call_here {
+                            (
+                                crate::i18n::gettext(app.locale, "Hang up").into_owned(),
+                                Icon::PhoneOff,
+                                palette.danger,
+                                Action::HangupCall,
+                            )
+                        } else {
+                            (
+                                crate::i18n::gettext(app.locale, "Voice call").into_owned(),
+                                Icon::Phone,
+                                palette.secondary,
+                                Action::StartCall(chat.id.clone()),
+                            )
+                        };
+                        // On a vibrant window each sits on its own glass, as
+                        // Search and More do.
+                        if palette.vibrant() {
+                            ui.add_space(BUTTON_GAP);
+                        }
+                        let call_glass = ui.painter().add(egui::Shape::Noop);
+                        let call_button = theme::icon_button(
+                            ui,
+                            call_icon,
+                            18.0,
+                            call_fill,
+                            palette.text,
+                            &call_tooltip,
+                        );
+                        if palette.vibrant() {
+                            ui.painter()
+                                .set(call_glass, glass_button(&palette, call_button.rect));
+                        }
+                        if call_button.clicked() {
+                            app.actions.push(call);
+                        }
+                        if !call_here {
+                            let tip = crate::i18n::gettext(app.locale, "Video call");
+                            if palette.vibrant() {
+                                ui.add_space(BUTTON_GAP);
+                            }
+                            let video_glass = ui.painter().add(egui::Shape::Noop);
+                            let video = theme::icon_button(
+                                ui,
+                                Icon::Video,
+                                18.0,
+                                palette.secondary,
+                                palette.text,
+                                &tip,
+                            );
+                            if palette.vibrant() {
+                                ui.painter()
+                                    .set(video_glass, glass_button(&palette, video.rect));
+                            }
+                            if video.clicked() {
+                                app.actions.push(Action::StartVideoCall(chat.id.clone()));
+                            }
+                        }
+                    }
                     let searching = app.chat_search_open;
                     let tip = format!(
                         "{} ({})",
                         crate::i18n::gettext(app.locale, "Search messages"),
                         super::keys::label("Ctrl+F")
                     );
-                    if theme::icon_button(
+                    if palette.vibrant() {
+                        ui.add_space(BUTTON_GAP);
+                    }
+                    let search_glass = ui.painter().add(egui::Shape::Noop);
+                    let search = theme::icon_button(
                         ui,
                         Icon::Search,
                         18.0,
@@ -355,9 +804,12 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                         palette.text,
                         &tip,
                     )
-                    .tab_stop(Stop::ChatSearch)
-                    .clicked()
-                    {
+                    .tab_stop(Stop::ChatSearch);
+                    if palette.vibrant() {
+                        ui.painter()
+                            .set(search_glass, glass_button(&palette, search.rect));
+                    }
+                    if search.clicked() {
                         app.actions.push(if searching {
                             Action::CloseChatSearch
                         } else {
@@ -367,15 +819,30 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                     // A narrow window shows the list or the chat, not both;
                     // this is the way back to the list.
                     if narrow {
+                        if palette.vibrant() {
+                            ui.add_space(BUTTON_GAP);
+                        }
+                        let back_glass = ui.painter().add(egui::Shape::Noop);
+                        // On the Calls tab the list underneath is the call
+                        // history.
+                        let back_label = if app.page == crate::model::Page::Calls {
+                            crate::i18n::gettext(app.locale, "Back to the calls").into_owned()
+                        } else {
+                            "Back to chats".to_owned()
+                        };
                         let back = theme::icon_button(
                             ui,
                             Icon::ArrowLeft,
                             18.0,
                             palette.secondary,
                             palette.text,
-                            "Back to chats",
+                            &back_label,
                         )
                         .tab_stop(Stop::Back);
+                        if palette.vibrant() {
+                            ui.painter()
+                                .set(back_glass, glass_button(&palette, back.rect));
+                        }
                         ui.ctx()
                             .data_mut(|data| data.insert_temp(back_button_id(), back.rect));
                         if back.clicked() {
@@ -737,6 +1204,7 @@ fn mention_picker(app: &mut App, ui: &mut egui::Ui, chat: &Chat, field: egui::Id
     let submit = take_plain_key(ui, Key::Enter) || take_plain_key(ui, Key::Tab);
     let mut picked = submit.then(|| candidates[app.mention_selected].clone());
     let palette = app.palette;
+    let everyone_alias = crate::mentions::everyone_alias(app.locale);
 
     let list = widgets::raised(ui, &palette, suggestion_frame(&palette), |ui| {
         let row_height = 38.0;
@@ -763,18 +1231,40 @@ fn mention_picker(app: &mut App, ui: &mut egui::Ui, chat: &Chat, field: egui::Id
                         pos2(rect.left() + 19.0, rect.center().y),
                         Vec2::splat(28.0),
                     );
-                    let picture = app.avatar(id);
-                    widgets::paint_avatar(
-                        ui,
-                        &palette,
-                        avatar,
-                        label.trim_start_matches('~'),
-                        id,
-                        picture.as_deref(),
-                    );
-                    let detail = crate::model::phone_of(id)
-                        .map(crate::util::phone)
-                        .unwrap_or_default();
+                    let everyone = id == crate::mentions::ALL_ID;
+                    if everyone {
+                        ui.painter().circle_filled(
+                            avatar.center(),
+                            avatar.width() / 2.0,
+                            palette.avatar(crate::util::hue(id)),
+                        );
+                        theme::paint_icon(
+                            ui,
+                            Icon::Users,
+                            avatar,
+                            avatar.width() * 0.5,
+                            Color32::WHITE,
+                        );
+                    } else {
+                        let picture = app.avatar(id);
+                        widgets::paint_avatar(
+                            ui,
+                            &palette,
+                            avatar,
+                            label.trim_start_matches('~'),
+                            id,
+                            picture.as_deref(),
+                        );
+                    }
+                    let detail = if everyone
+                        && !everyone_alias.eq_ignore_ascii_case(crate::mentions::ALL_USER)
+                    {
+                        everyone_alias.clone()
+                    } else {
+                        crate::model::phone_of(id)
+                            .map(crate::util::phone)
+                            .unwrap_or_default()
+                    };
                     let detail = widgets::line(
                         ui,
                         &detail,
@@ -832,6 +1322,7 @@ fn mention_picker(app: &mut App, ui: &mut egui::Ui, chat: &Chat, field: egui::Id
     }
 }
 
+/// Draws the composer and queues sends with the originating account and selected mentions.
 fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     let palette = app.palette;
     let shown = egui::Panel::bottom("composer")
@@ -929,13 +1420,39 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
             if app.editing.is_some() {
                 edit_strip(app, ui);
             } else if let Some(reply_id) = app.reply_to.clone() {
-                let quoted = app
-                    .conversations
-                    .get(&chat.id)
-                    .and_then(|conversation| conversation.message(&reply_id))
-                    .cloned();
+                let quoted = app.reply_preview(&reply_id, &chat.id).cloned();
                 match quoted {
                     Some(quoted) => reply_strip(app, ui, &quoted),
+                    None if reply_id.chat.is_some() => {
+                        // Losing the source page must never silently turn a
+                        // private reply into an unquoted send. The worker
+                        // resolves the original from the archive on Send.
+                        let palette = app.palette;
+                        let strip = widgets::raised(ui, &palette, strip_frame(&palette), |ui| {
+                            ui.set_width(ui.available_width().max(0.0));
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_max_width((ui.available_width() - 40.0).max(0.0));
+                                    widgets::rich_text(
+                                        ui,
+                                        &crate::i18n::gettext(app.locale, "Original group message unavailable"),
+                                        theme::regular(12.5),
+                                        palette.secondary,
+                                    );
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if theme::icon_button(
+                                        ui, Icon::X, 16.0, palette.secondary, palette.text,
+                                        "Cancel reply (Esc)",
+                                    ).clicked() {
+                                        app.actions.push(Action::CancelReply);
+                                    }
+                                });
+                            });
+                        });
+                        ui.ctx().data_mut(|data| data.insert_temp(reply_strip_id(), strip.response.rect));
+                        strip_gap(ui);
+                    }
                     None => app.reply_to = None,
                 }
             }
@@ -1261,7 +1778,10 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                 }
                                 // The composer waits for the image preview to
                                 // close before taking focus back.
-                                if app.focus_composer && app.image_preview.is_none() {
+                                if app.focus_composer
+                                    && app.image_preview.is_none()
+                                    && app.sticker_view.is_none()
+                                {
                                     app.focus_composer = false;
                                     response.request_focus();
                                 }
@@ -1324,6 +1844,8 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     });
                 } else {
                     app.actions.push(Action::SendPending {
+                        account: app.account().id.clone(),
+                        mentions: app.composer_mentions(),
                         chat: chat.id.clone(),
                         caption: text,
                     });
@@ -1462,8 +1984,15 @@ fn last_line<R>(ui: &mut egui::Ui, line: f32, add: impl FnOnce(&mut egui::Ui) ->
 
 /// The rounded field that holds the composer's controls, or the recorder.
 fn composer_pill(palette: &Palette) -> Frame {
+    // Glass over a vibrant conversation, as the header's.
+    let (fill, edge) = if palette.vibrant() {
+        (palette.glass(), palette.glass_edge())
+    } else {
+        (palette.bubble_in, Stroke::NONE)
+    };
     Frame::new()
-        .fill(palette.bubble_in)
+        .fill(fill)
+        .stroke(edge)
         .corner_radius(CornerRadius::same(COMPOSER_RADIUS))
         // The end buttons are inset by as much at the sides as above and
         // below, so they sit evenly in the rounded ends.
@@ -1475,7 +2004,8 @@ fn composer_pill(palette: &Palette) -> Frame {
         })
 }
 
-/// The plus menu beside the composer: send files or create a poll.
+/// The plus menu beside the composer: send files, documents or a location,
+/// or create a poll.
 fn composer_tools_menu(app: &mut App, chat: &Chat, plus: &egui::Response) {
     let id = plus.id.with("composer-tools");
     let mut open = app.composer_tools_open;
@@ -1497,7 +2027,18 @@ fn composer_tools_menu(app: &mut App, chat: &Chat, plus: &egui::Response) {
             .show(|ui| {
                 let send_files = crate::i18n::gettext(app.locale, "Send files");
                 if widgets::menu_item(ui, &app.palette, Some(Icon::Paperclip), &send_files) {
-                    app.actions.push(Action::Attach);
+                    app.actions.push(Action::Attach { documents: false });
+                }
+                // Pictures picked here keep their own bytes instead of
+                // becoming compressed photos.
+                let document = crate::i18n::gettext(app.locale, "Send as document");
+                if widgets::menu_item(ui, &app.palette, Some(Icon::FileText), &document) {
+                    app.actions.push(Action::Attach { documents: true });
+                }
+                let send_location = crate::i18n::gettext(app.locale, "Send location");
+                if widgets::menu_item(ui, &app.palette, Some(Icon::MapPin), &send_location) {
+                    app.actions
+                        .push(Action::ShowDialog(Dialog::SendLocation(chat.id.clone())));
                 }
                 let create_poll = crate::i18n::gettext(app.locale, "Create poll");
                 if widgets::menu_item(ui, &app.palette, Some(Icon::ListChecks), &create_poll) {
@@ -1680,11 +2221,20 @@ struct View<'a> {
     me: Option<&'a str>,
     auto_download: bool,
     connected: bool,
+    account_receipts_off: bool,
     poll_voting: &'a HashSet<(ChatId, String)>,
     interactive_pending: &'a HashSet<(ChatId, String)>,
+    /// Whether this chat is selecting whole messages.
+    selecting: bool,
     anchor: Option<&'a str>,
     /// Demo/test: keep this message's context menu open.
     open_menu: Option<&'a str>,
+    /// Ids of the starred messages of this chat, for the mark in the footer.
+    starred: Option<&'a HashSet<String>>,
+    /// Ids of this chat's pinned messages, for the menu and the bubble mark.
+    pins: Option<&'a HashSet<String>>,
+    /// Active pins of this chat, for the notices in the transcript.
+    pin_notices: &'a [crate::archive::Pinned],
     reaction: Option<&'a str>,
     /// The reaction picker was opened from the message's context menu.
     reaction_menu: bool,
@@ -1699,6 +2249,8 @@ struct View<'a> {
     now: i64,
     /// Animate media only while this window is active.
     animate: bool,
+    /// The motion photo of this chat whose clip plays.
+    motion_playing: Option<&'a str>,
     player: &'a crate::audio::Player,
     video: &'a crate::video::Player,
     /// Local speech-to-text of the Transcription extension.
@@ -1706,14 +2258,44 @@ struct View<'a> {
     /// The extension is on and its model is present, so a bubble may offer
     /// the transcribe button.
     transcription_ready: bool,
-    copy_rows: &'a std::sync::Mutex<Vec<crate::transcript::Row>>,
+    copy_rows: Option<&'a std::sync::Mutex<Vec<crate::transcript::Row>>>,
+}
+
+/// Protocol album parent carried by pictures and ordinary videos.
+fn album_id(message: &Message) -> Option<&str> {
+    match &message.content {
+        Content::Image { media, .. }
+        | Content::Video {
+            media, note: false, ..
+        } => media.album.as_deref(),
+        _ => None,
+    }
+}
+
+/// The consecutive messages belonging to the album beginning at `start`.
+/// A single marked item is rendered normally because there is nothing to group.
+fn album_run(messages: &[Message], start: usize) -> Option<&[Message]> {
+    let first = messages.get(start)?;
+    let album = album_id(first)?;
+    let mut end = start + 1;
+    while let Some(message) = messages.get(end) {
+        if album_id(message) != Some(album)
+            || message.from_me != first.from_me
+            || message.sender != first.sender
+            || crate::util::day_key(message.timestamp) != crate::util::day_key(first.timestamp)
+        {
+            break;
+        }
+        end += 1;
+    }
+    (end > start + 1).then_some(&messages[start..end])
 }
 
 /// A row height to assume for a message that has not been laid out yet. Rows
 /// near the viewport are always measured, and a change in the height of a row
 /// above the viewport moves the scroll offset with it, so this only shapes the
 /// scrollbar until the reader scrolls near the row.
-fn estimated_height(message: &Message, width: f32, new_day: bool) -> f32 {
+fn estimated_height(message: &Message, width: f32, new_day: bool, notices: usize) -> f32 {
     // Bubbles take at most 72% of the transcript, and 560 points.
     let bubble = ((width * 0.72).min(560.0) - 20.0).max(40.0);
     let text_rows = |text: &str| {
@@ -1739,9 +2321,72 @@ fn estimated_height(message: &Message, width: f32, new_day: bool) -> f32 {
         _ => 40.0,
     };
     // Bubble padding, the sender line, and the row spacing, plus the date
-    // chip above the first message of a day.
-    40.0 + body + if new_day { 36.0 } else { 0.0 }
+    // chip above the first message of a day, and any pin notice this row
+    // carries.
+    40.0 + body + if new_day { 36.0 } else { 0.0 } + notices as f32 * PIN_NOTICE_HEIGHT
 }
+
+/// The pins the transcript places, oldest first. `chat_pins` hands them over
+/// newest first, and a notice belongs above the first message that came after
+/// its pin, so the list goes back into time order before it is placed.
+fn pin_notices_in_time_order(rows: &[crate::archive::Pinned]) -> Vec<crate::archive::Pinned> {
+    let mut sorted = rows.to_vec();
+    sorted.sort_by_key(|row| row.pinned_at);
+    sorted
+}
+
+/// How many notices, from the front of the list, belong above a message that
+/// arrived at `timestamp`.
+fn notices_above(notices: &[crate::archive::Pinned], timestamp: i64) -> usize {
+    notices
+        .iter()
+        .take_while(|notice| notice.pinned_at <= timestamp)
+        .count()
+}
+
+/// The notice a pin leaves in the transcript, where the pin happened, as the
+/// phone shows it.
+fn pin_notice(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    locale: crate::i18n::Locale,
+    names: &dyn Fn(&str, Option<&str>) -> String,
+    row: &crate::archive::Pinned,
+) {
+    let label = pin_notice_label(locale, row, names);
+    ui.vertical_centered(|ui| {
+        widgets::chip(ui, palette, &label);
+    });
+}
+
+/// The words a pin notice shows: who pinned it, or a neutral line when the
+/// archive does not say.
+fn pin_notice_label(
+    locale: crate::i18n::Locale,
+    row: &crate::archive::Pinned,
+    names: &dyn Fn(&str, Option<&str>) -> String,
+) -> String {
+    if row.pinner.by_me {
+        return crate::i18n::gettext(locale, "You pinned a message").to_string();
+    }
+    if row.pinner.sender.is_empty() {
+        return crate::i18n::gettext(locale, "A message was pinned").to_string();
+    }
+    crate::i18n::gettext(locale, "{} pinned a message")
+        .replace("{}", &names(&row.pinner.sender, None))
+}
+
+/// The pins the line under the header shows: one that has run out its seven
+/// days leaves, whether or not a refresh has reached this window yet.
+fn live_pins(rows: &[crate::archive::Pinned], now: i64) -> Vec<crate::archive::Pinned> {
+    rows.iter()
+        .filter(|row| row.expires_at > now)
+        .cloned()
+        .collect()
+}
+
+/// What one pin notice takes in the transcript: the chip and its spacing.
+const PIN_NOTICE_HEIGHT: f32 = 32.0;
 
 /// Incoming messages carry their sender's picture and name in groups only,
 /// as on WhatsApp.
@@ -1749,7 +2394,72 @@ fn shows_sender_pictures(chat: &Chat) -> bool {
     chat.is_group()
 }
 
-fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
+/// How long the sticky date stays after the transcript stops moving.
+const STICKY_DATE_HOLD: f64 = 1.0;
+/// How long the sticky date takes to fade out.
+const STICKY_DATE_FADE: f32 = 0.25;
+
+/// Keeps the first visible message's date at the top of the transcript once
+/// its day separator has scrolled away, while the reader scrolls: it fades
+/// out a moment after the transcript stops moving, as on the phone.
+/// Following new messages at the bottom does not count as scrolling.
+fn sticky_date<R>(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    locale: crate::i18n::Locale,
+    chat: &Chat,
+    output: &egui::scroll_area::ScrollAreaOutput<R>,
+    visible_day: Option<(i64, f32)>,
+) {
+    let id = egui::Id::new(("visible-message-date", &chat.id));
+    let ctx = ui.ctx().clone();
+    let now = ui.input(|input| input.time);
+    let offset = output.state.offset.y;
+    let viewport = output.inner_rect;
+    let at_bottom = offset + viewport.height() >= output.content_size.y - 24.0;
+    let (last_offset, was_at_bottom, mut moved_at) = ctx
+        .data(|data| data.get_temp::<(f32, bool, f64)>(id))
+        .unwrap_or((offset, at_bottom, f64::NEG_INFINITY));
+    if (offset - last_offset).abs() > 0.5 && !(at_bottom && was_at_bottom) {
+        moved_at = now;
+    }
+    ctx.data_mut(|data| data.insert_temp(id, (offset, at_bottom, moved_at)));
+    let since = now - moved_at;
+    let scrolling = since < STICKY_DATE_HOLD;
+    if scrolling {
+        // One wake-up for the moment the fade begins; the fade itself
+        // repaints through `animate_bool` and stops once it is done.
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(STICKY_DATE_HOLD - since));
+    }
+    // It appears at once when scrolling starts and fades only on the way out.
+    let fade = if scrolling { 0.0 } else { STICKY_DATE_FADE };
+    let opacity = ctx.animate_bool_with_time(id, scrolling, fade);
+    let Some((timestamp, separator_top)) = visible_day else {
+        return;
+    };
+    if opacity <= 0.0 || separator_top >= viewport.top() {
+        return;
+    }
+    // Paint after the scroll contents, inside their clip, without changing
+    // their height or taking clicks away from the messages underneath.
+    let mut overlay = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id)
+            .max_rect(viewport.shrink2(vec2(0.0, 8.0)))
+            .layout(Layout::top_down(Align::Center)),
+    );
+    overlay.set_clip_rect(viewport);
+    overlay.multiply_opacity(opacity);
+    widgets::chip(
+        &mut overlay,
+        palette,
+        &crate::util::day_label(locale, timestamp),
+    );
+}
+
+/// The conversation's messages. `under` is how much of the list's top lies
+/// beneath the header, which a vibrant window lays over it.
+fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32) {
     let palette = app.palette;
     // Taken up front: `names_or` below borrows the rest of `app` for the
     // whole function, so a pending scroll must come out before that.
@@ -1788,14 +2498,25 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         me: app.me.as_deref(),
         auto_download: app.account().settings.auto_download,
         connected: app.link.is_connected(),
+        account_receipts_off: app.account_receipts_off,
         poll_voting: &app.poll_voting,
         interactive_pending: &app.interactive_sending,
+        selecting: app
+            .selection
+            .as_ref()
+            .is_some_and(|(selected_chat, _)| *selected_chat == chat.id),
         anchor: if conversation.loading_older || conversation.fetching_phone {
             None
         } else {
             app.scroll_anchor.as_deref()
         },
         open_menu: app.open_message_menu.as_deref(),
+        starred: app.stars.get(&chat.id),
+        pins: app.pins.get(&chat.id),
+        pin_notices: app
+            .chat_pins
+            .get(&chat.id)
+            .map_or(&[][..], |rows| rows.as_slice()),
         reaction: app
             .reaction_target
             .as_ref()
@@ -1810,6 +2531,11 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         contacts: &app.contacts,
         now: crate::util::now(),
         animate: app.window_focused,
+        motion_playing: app
+            .motion_playing
+            .as_ref()
+            .filter(|(playing, _)| *playing == chat.id)
+            .map(|(_, message)| message.as_str()),
         player: &app.player,
         video: &app.video,
         transcriber: &app.transcriber,
@@ -1820,7 +2546,10 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     &crate::transcription::models_dir(&app.dirs),
                 )
             }),
-        copy_rows: app.copy_rows.as_ref(),
+        // Whole-message exports are already formatted. Do not let the
+        // text-selection annotator reinterpret them as drawn body text.
+        copy_rows: (!app.selection.as_ref().is_some_and(|(id, _)| *id == chat.id))
+            .then_some(app.copy_rows.as_ref()),
     };
     let mut actions = Vec::new();
     let mut anchored = false;
@@ -1910,8 +2639,10 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     // the `Ui`'s id, so the salt must go through the same `IdSalt::new` here
     // to land on the same id.
     let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("messages", &chat.id)));
-    let offset =
-        egui::scroll_area::State::load(ui.ctx(), scroll_id).map_or(0.0, |state| state.offset.y);
+    let scroll_state = egui::scroll_area::State::load(ui.ctx(), scroll_id);
+    // The list has not been shown before: it starts at the top.
+    let first_show = scroll_state.is_none();
+    let offset = scroll_state.map_or(0.0, |state| state.offset.y);
     // A keyboard scroll under way stops for a jump to a message, for the
     // reaction bar, which holds the view still, and for a wheel or trackpad
     // turn over the message list, before it takes another step.
@@ -1943,6 +2674,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     // a held key's repeats, which restart it, never stall it.
     let key_start = time - f64::from(ui.input(|input| input.stable_dt.min(0.1)));
     let mut pinned = false;
+    let mut visible_day = None;
     let output = egui::ScrollArea::vertical()
         .id_salt(("messages", &chat.id))
         .auto_shrink([false, false])
@@ -1999,26 +2731,100 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     ui.ctx().request_repaint();
                 }
             }
-            Frame::new()
-                .inner_margin(Margin::symmetric(18, 10))
+            // A chat shorter than the view sits at its bottom, next to the
+            // composer, as on WhatsApp: the space above it is what the
+            // messages left free last frame.
+            let natural_id = scroll_id.with("natural-height");
+            let natural = ui.ctx().data(|data| data.get_temp::<f32>(natural_id));
+            // The spacing after the filler is part of the space it takes.
+            let filler = bottom_filler(viewport.height(), natural, ui.spacing().item_spacing.y);
+            // While a button is held (a sweep, a text selection, a click),
+            // the rows stay where the pointer found them: a sweep turns the
+            // composer into the selection bar, and the view's new height
+            // would otherwise move every row under the pointer.
+            let filler_id = scroll_id.with("filler");
+            let held = ui.input(|input| input.pointer.any_down());
+            let filler = match ui.ctx().data(|data| data.get_temp::<f32>(filler_id)) {
+                Some(kept) if held => kept,
+                _ => filler,
+            };
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(filler_id, filler));
+            if filler > 0.0 {
+                ui.add_space(filler);
+            }
+            let side = if palette.bubbles == theme::BubbleStyle::Messages {
+                MESSAGES_SIDE_MARGIN
+            } else {
+                WHATSAPP_SIDE_MARGIN
+            };
+            let measured = Frame::new()
+                .inner_margin(Margin::symmetric(side, 10))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 3.0;
+                    if under > 0.0 {
+                        ui.add_space(under);
+                    }
                     top_of_history(ui, &palette, &conversation, chat, &mut actions);
                     let mut previous: Option<&Message> = None;
+                    let mut day_separator_top = f32::NEG_INFINITY;
+                    // The pin notices still to place, in time order. Each one
+                    // sits above the first message that came after it, so the
+                    // row it belongs to carries its height.
+                    let notices = pin_notices_in_time_order(view.pin_notices);
+                    let mut placed = 0;
                     // Rows within a few viewports of the screen are laid out
                     // and their height remembered, so scrolling finds them
                     // measured before they show.
                     let margin = (viewport.height() * 3.0).max(600.0);
-                    for message in &conversation.messages {
+                    for (message_index, message) in conversation.messages.iter().enumerate() {
+                        let index = message_index;
+                        // WhatsApp marks every item in a media album with the
+                        // same parent id. Only its first item owns a row; the
+                        // remaining consecutive items are painted in that row.
+                        if selection.is_none()
+                            && message_index > 0
+                            && album_id(message).is_some()
+                            && album_id(&conversation.messages[message_index - 1])
+                                == album_id(message)
+                            && conversation.messages[message_index - 1].from_me == message.from_me
+                            && conversation.messages[message_index - 1].sender == message.sender
+                            && crate::util::day_key(
+                                conversation.messages[message_index - 1].timestamp,
+                            ) == crate::util::day_key(message.timestamp)
+                        {
+                            rows.insert(
+                                message.id.clone(),
+                                RowHeight {
+                                    height: 0.0,
+                                    pass: Some(pass),
+                                },
+                            );
+                            previous = Some(message);
+                            continue;
+                        }
+                        let album = selection
+                            .is_none()
+                            .then(|| album_run(&conversation.messages, message_index))
+                            .flatten();
+                        let row_contains = |id: &str| {
+                            message.id == id
+                                || album.is_some_and(|items| items.iter().any(|item| item.id == id))
+                        };
+                        let row_is_anchor = view.anchor.is_some_and(row_contains);
                         let before = ui.cursor().top();
                         let new_day = previous.is_none_or(|previous| {
                             crate::util::day_key(previous.timestamp)
                                 != crate::util::day_key(message.timestamp)
                         });
+                        if new_day {
+                            day_separator_top = before + 8.0;
+                        }
+                        let here = notices_above(&notices[placed..], message.timestamp);
                         let known = rows.get(&message.id).copied();
                         let height = known.map_or_else(
-                            || estimated_height(message, layout_width, new_day),
+                            || estimated_height(message, layout_width, new_day, here),
                             |row| row.height,
                         );
                         // A pass redone after the offset followed rows that
@@ -2077,8 +2883,15 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             });
                             ui.add_space(4.0);
                         }
+                        for _ in 0..here {
+                            let Some(notice) = notices.get(placed) else {
+                                break;
+                            };
+                            pin_notice(ui, &palette, view.locale, view.names_or, notice);
+                            placed += 1;
+                        }
                         if let Some((id, count, placed)) = &divider
-                            && *id == message.id
+                            && row_contains(id)
                         {
                             ui.add_space(6.0);
                             let label = crate::i18n::ngettext(
@@ -2092,7 +2905,11 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                 .vertical_centered(|ui| widgets::chip(ui, &palette, &label))
                                 .inner;
                             if !placed && view.anchor.is_none() {
-                                response.scroll_to_me(Some(Align::Min));
+                                // Clear of the header that may lie over the top.
+                                ui.scroll_to_rect(
+                                    response.rect.with_min_y(response.rect.top() - under),
+                                    Some(Align::Min),
+                                );
                                 divider_placed = true;
                             }
                             ui.add_space(4.0);
@@ -2105,17 +2922,29 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                 }));
                         // The first message of a run from one side, as the
                         // phone draws it: a little apart, with a tail.
-                        let first_in_run = new_day
-                            || previous.is_none_or(|previous| {
-                                previous.from_me != message.from_me
-                                    || (!message.from_me && previous.sender != message.sender)
-                            });
+                        let first_in_run =
+                            new_day || previous.is_none_or(|previous| !same_run(previous, message));
+                        // Messages curls its tail under a run's last bubble.
+                        // The sender's picture: beside the first message of a
+                        // run in WhatsApp's style, beside the last in Messages.
+                        let show_avatar = if palette.bubbles == theme::BubbleStyle::Messages {
+                            shows_sender_pictures(chat)
+                                && !message.from_me
+                                && last_of_run(&conversation.messages, index)
+                        } else {
+                            show_sender
+                        };
+                        let tailed = if palette.bubbles == theme::BubbleStyle::Messages {
+                            last_bubble_of_run(&palette, &conversation.messages, index)
+                        } else {
+                            first_in_run
+                        };
                         if first_in_run && !new_day && previous.is_some() {
                             ui.add_space(RUN_GAP);
                         }
                         let flash = jump
                             .as_ref()
-                            .filter(|jump| jump.message == message.id)
+                            .filter(|jump| row_contains(&jump.message))
                             .map(|_| (ui.painter().add(egui::Shape::Noop), ui.cursor().top()));
                         // While selecting, every row gains a check box in a
                         // column on the left and a band behind it, as in
@@ -2132,8 +2961,12 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                         ui,
                                         &view,
                                         message,
-                                        show_sender,
-                                        first_in_run,
+                                        album,
+                                        RunPlace {
+                                            show_sender,
+                                            show_avatar,
+                                            tailed,
+                                        },
                                         &mut actions,
                                     )
                                 })
@@ -2141,10 +2974,21 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             })
                             .inner
                         } else {
-                            bubble(ui, &view, message, show_sender, first_in_run, &mut actions)
+                            bubble(
+                                ui,
+                                &view,
+                                message,
+                                album,
+                                RunPlace {
+                                    show_sender,
+                                    show_avatar,
+                                    tailed,
+                                },
+                                &mut actions,
+                            )
                         };
                         if let Some((slot, top)) = flash {
-                            if view.anchor == Some(message.id.as_str()) && response.is_some() {
+                            if row_is_anchor && response.is_some() {
                                 jump_since.set(Some(time));
                             }
                             let strength = jump_since
@@ -2167,7 +3011,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                 );
                             }
                             if jump_since.get().is_some() {
-                                ui.ctx().request_repaint();
+                                crate::motion::request_frame(ui.ctx());
                             }
                         }
                         if let (Some(selected), Some(response), Some((slot, top))) =
@@ -2275,7 +3119,46 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                     to: message.id.clone(),
                                 });
                             }
-                            if selectable && (response.clicked() || pick.clicked()) {
+                            let keyboard_clicked = (pick.clicked() && pick.has_focus()
+                                || response.clicked() && response.has_focus())
+                                && ui.input(|input| {
+                                    input.raw.events.iter().any(|event| {
+                                        matches!(
+                                            event,
+                                            egui::Event::Key {
+                                                key: egui::Key::Enter,
+                                                pressed: true,
+                                                ..
+                                            }
+                                        )
+                                    })
+                                });
+                            theme::focus_outline(ui, response.id, check.expand(3.0), 4.0);
+                            let popup = egui::Popup::menu(&pick)
+                                .open_memory(if pick.secondary_clicked() || keyboard_clicked {
+                                    Some(egui::SetOpenCommand::Bool(true))
+                                } else {
+                                    None
+                                })
+                                .frame(widgets::menu_frame(&palette));
+                            let popup = if keyboard_clicked {
+                                popup.at_position(row.left_top() + vec2(12.0, 8.0))
+                            } else {
+                                popup.at_pointer_fixed()
+                            };
+                            popup.show(|ui| {
+                                selection_menu(
+                                    ui,
+                                    &view,
+                                    &conversation.messages,
+                                    selected,
+                                    &mut actions,
+                                );
+                            });
+                            if selectable
+                                && !keyboard_clicked
+                                && (response.clicked() || pick.clicked())
+                            {
                                 let shift = ui.input(|input| input.modifiers.shift);
                                 actions.push(if shift {
                                     Action::SelectRange(message.id.clone())
@@ -2292,12 +3175,18 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             actions.push(Action::SelectMessage(message.id.clone()));
                         }
                         if let Some(response) = response
-                            && view.anchor == Some(message.id.as_str())
+                            && row_is_anchor
                         {
                             response.scroll_to_me(Some(Align::Center));
                             anchored = true;
                         }
                         let measured = ui.cursor().top() - before;
+                        if visible_day.is_none()
+                            && before + measured > viewport.top()
+                            && before < viewport.bottom()
+                        {
+                            visible_day = Some((message.timestamp, day_separator_top));
+                        }
                         if before + height <= viewport.top() {
                             grew_above += measured - height;
                         }
@@ -2319,6 +3208,11 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             to: row.to_owned(),
                         });
                     }
+                    // A pin made after the newest message keeps its notice at
+                    // the end of the transcript.
+                    for notice in &notices[placed..] {
+                        pin_notice(ui, &palette, view.locale, view.names_or, notice);
+                    }
                     if !typing.is_empty() {
                         typing_bubble(ui, &view, &typing);
                     }
@@ -2339,7 +3233,15 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         );
                         pinned = true;
                     }
-                });
+                })
+                .response
+                .rect
+                .height();
+            if natural.is_none_or(|natural| (natural - measured).abs() > 0.5) {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(natural_id, measured));
+                ui.ctx().request_repaint();
+            }
             if background.clicked() {
                 actions.push(Action::FocusComposer);
             }
@@ -2389,6 +3291,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         });
     app.scroll_route
         .place(crate::app::ScrollPane::Messages, output.inner_rect);
+    sticky_date(ui, &palette, app.locale, chat, &output, visible_day);
     let at_bottom =
         output.state.offset.y + output.inner_rect.height() >= output.content_size.y - 24.0;
     ui.ctx().data_mut(|data| {
@@ -2440,6 +3343,13 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         state.store(ui.ctx(), output.id);
         ui.ctx()
             .request_discard("transcript rows above the viewport changed height");
+    }
+    // A jump to the end moves the offset only after the rows were painted at
+    // the old one. On a chat's first showing that is the top of its first
+    // page, which would flash for a frame before the end; redo the pass at
+    // the end instead.
+    if first_show && pinned && !redo && (output.state.offset.y - offset).abs() >= 0.5 {
+        ui.ctx().request_discard("scrolled to the end");
     }
     if reader_scrolled {
         key_scroll = None;
@@ -2676,7 +3586,14 @@ fn typing_bubble(ui: &mut egui::Ui, view: &View<'_>, typers: &[(String, String)]
             .rect;
         ui.painter().set(
             backdrop,
-            widgets::bubble_shape(&palette, rect, palette.bubble_in, Some(widgets::Side::Left)),
+            widgets::bubble_shape(
+                &palette,
+                rect,
+                palette.bubble_in,
+                Some(widgets::Side::Left),
+                ui.ctx().pixels_per_point(),
+                ui.clip_rect().y_range(),
+            ),
         );
     });
 }
@@ -2693,8 +3610,9 @@ fn typing_dots(ui: &mut egui::Ui, palette: &Palette) {
         return;
     }
     // Every frame, paced by vsync like egui's own animations; drawn only
-    // while visible, and a hidden window gets no frames at all.
-    ui.ctx().request_repaint();
+    // while visible, and a hidden window gets no frames at all. Stepped
+    // while a screen reader is attached: see `motion`.
+    crate::motion::request_frame(ui.ctx());
     let time = ui.input(|input| input.time);
     for index in 0..3 {
         let wave = ((time * std::f64::consts::TAU / 1.2) - f64::from(index) * 0.9).sin() as f32;
@@ -2778,6 +3696,10 @@ fn reaction_affordance(
     // and catching the pointer, at the edge of the transcript.
     let shown = bubble.rect.intersect(bounds);
     if shown.height() < REACTION_AFFORDANCE_SIZE || shown.width() <= 0.0 {
+        return;
+    }
+    // A call in the chat is a record, as in WhatsApp: no reactions, no replies.
+    if matches!(message.content, Content::Call { .. }) {
         return;
     }
     let rect = reaction_affordance_rect(shown, bounds, message.from_me);
@@ -2876,15 +3798,29 @@ fn reaction_affordance(
     }
 }
 
+/// Where a message sits in its sender's run: whether it names the sender,
+/// shows their picture, and carries the bubble's tail.
+#[derive(Clone, Copy)]
+struct RunPlace {
+    show_sender: bool,
+    show_avatar: bool,
+    tailed: bool,
+}
+
 /// Draws a message row and returns its bubble response for scrolling.
 fn bubble(
     ui: &mut egui::Ui,
     view: &View<'_>,
     message: &Message,
-    show_sender: bool,
-    first_in_run: bool,
+    album: Option<&[Message]>,
+    place: RunPlace,
     actions: &mut Vec<Action>,
 ) -> Option<egui::Response> {
+    let RunPlace {
+        show_sender,
+        show_avatar,
+        tailed,
+    } = place;
     let own = message.from_me;
     // Greys that read on the panel can vanish on the bubble; use its own.
     let view = &View {
@@ -2893,8 +3829,14 @@ fn bubble(
     };
     let with_avatar = !own && shows_sender_pictures(view.chat);
     let carousel = matches!(&message.content, Content::Interactive { card: Some(card), .. } if !card.carousel.is_empty());
-    let max_width = ((ui.available_width() * if carousel { 0.95 } else { 0.72 })
-        .min(if carousel { 920.0 } else { 560.0 })
+    let share = if carousel {
+        0.95
+    } else if view.palette.bubbles == theme::BubbleStyle::Messages {
+        MESSAGES_WIDTH_SHARE
+    } else {
+        WHATSAPP_WIDTH_SHARE
+    };
+    let max_width = ((ui.available_width() * share).min(if carousel { 920.0 } else { 560.0 })
         - if with_avatar {
             SENDER_AVATAR + 8.0
         } else {
@@ -2927,23 +3869,48 @@ fn bubble(
         |ui| {
             if with_avatar {
                 ui.horizontal_top(|ui| {
-                    let (rect, avatar) = ui.allocate_exact_size(
-                        Vec2::splat(SENDER_AVATAR),
-                        if show_sender {
-                            Sense::CLICK
-                        } else {
-                            Sense::hover()
-                        },
-                    );
-                    theme::focus_outline(ui, avatar.id, rect, SENDER_AVATAR / 2.0);
-                    if show_sender
-                        && avatar
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                    {
-                        actions.push(Action::ShowDialog(Dialog::ChatInfo(message.sender.clone())));
+                    let (space, _) =
+                        ui.allocate_exact_size(Vec2::splat(SENDER_AVATAR), Sense::hover());
+                    // Keep bubble content vertically laid out inside the row.
+                    ui.vertical(|ui| {
+                        response = Some(bubble_frame(
+                            ui,
+                            view,
+                            message,
+                            album,
+                            show_sender,
+                            tailed,
+                            max_width,
+                            actions,
+                        ));
+                    });
+                    if !show_avatar {
+                        return;
                     }
-                    if show_sender && ui.is_rect_visible(rect) {
+                    // Messages puts the avatar beside the run's last message,
+                    // level with its bottom; WhatsApp beside the first, at
+                    // its top.
+                    let rect = match &response {
+                        Some(bubble) if view.palette.bubbles == theme::BubbleStyle::Messages => {
+                            Rect::from_min_size(
+                                pos2(
+                                    space.left(),
+                                    (bubble.rect.bottom() - SENDER_AVATAR).max(space.top()),
+                                ),
+                                Vec2::splat(SENDER_AVATAR),
+                            )
+                        }
+                        _ => space,
+                    };
+                    let avatar = ui.interact(rect, id.with("avatar"), Sense::CLICK);
+                    theme::focus_outline(ui, avatar.id, rect, SENDER_AVATAR / 2.0);
+                    if avatar
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        actions.push(Action::OpenInfo(message.sender.clone()));
+                    }
+                    if ui.is_rect_visible(rect) {
                         let name = (view.names_or)(&message.sender, message.sender_name.as_deref());
                         widgets::paint_avatar(
                             ui,
@@ -2956,37 +3923,31 @@ fn bubble(
                                 .and_then(|picture| picture.as_deref()),
                         );
                     }
-                    // Keep bubble content vertically laid out inside the row.
-                    ui.vertical(|ui| {
-                        response = Some(bubble_frame(
-                            ui,
-                            view,
-                            message,
-                            show_sender,
-                            first_in_run,
-                            max_width,
-                            actions,
-                        ));
-                    });
                 });
             } else {
                 response = Some(bubble_frame(
                     ui,
                     view,
                     message,
+                    album,
                     show_sender,
-                    first_in_run,
+                    tailed,
                     max_width,
                     actions,
                 ));
             }
-            if !message.reactions.is_empty() {
+            // An album row carries every member's reactions, each set
+            // reacting to its own item.
+            let members = album.unwrap_or(std::slice::from_ref(message));
+            if members.iter().any(|member| !member.reactions.is_empty()) {
                 ui.add_space(-7.0);
                 ui.horizontal(|ui| {
                     if with_avatar {
                         ui.add_space(SENDER_AVATAR + 8.0);
                     }
-                    reactions(ui, view, message, actions);
+                    for member in members.iter().filter(|member| !member.reactions.is_empty()) {
+                        reactions(ui, view, member, actions);
+                    }
                 });
                 ui.add_space(2.0);
             }
@@ -3077,10 +4038,65 @@ fn transcript_row(
     body: String,
     placements: Vec<String>,
 ) -> crate::transcript::Row {
+    message_copy_row(message, body, placements, view.names_or, view.mention_names)
+}
+
+/// Copies whole selected messages, including rows outside the viewport, in
+/// conversation order rather than the order in which they were selected.
+pub(super) fn selected_text(app: &App) -> Option<String> {
+    let (chat, selected) = app.selection.as_ref()?;
+    if app.open_chat.as_ref() != Some(chat) {
+        return None;
+    }
+    let conversation = app.conversations.get(chat)?;
+    let selected: HashSet<&str> = selected.iter().map(String::as_str).collect();
+    let names_or = |id: &str, hint: Option<&str>| app.display_name_or(id, hint);
+    let mention_names = |id: &str| app.mention_name(id);
+    let lines: Vec<String> = conversation
+        .messages
+        .iter()
+        .filter(|message| selected.contains(message.id.as_str()))
+        .map(|message| {
+            let text = match &message.content {
+                Content::Text { text, .. } | Content::Interactive { text, .. } => text.as_str(),
+                Content::Image { caption, .. }
+                | Content::Video { caption, .. }
+                | Content::Document { caption, .. }
+                | Content::StickerPack { caption, .. } => caption.as_deref().unwrap_or_default(),
+                _ => "",
+            };
+            let mentions: Vec<markup::Mention> = message
+                .mentions
+                .iter()
+                .map(|mention| markup::Mention {
+                    user: mention.user.clone(),
+                    name: mention_names(&mention.id),
+                })
+                .collect();
+            let body = markup::plain(text, &mentions);
+            let mut row = message_copy_row(message, body, Vec::new(), &names_or, &mention_names);
+            // Content without a transcript marker still needs a useful label.
+            if row.body.is_empty() && row.marker.is_none() {
+                row.body = message.content.full_summary();
+            }
+            row.line(&row.body)
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Builds shared transcript metadata for drawn text and whole-message exports.
+fn message_copy_row(
+    message: &Message,
+    body: String,
+    placements: Vec<String>,
+    names_or: &dyn Fn(&str, Option<&str>) -> String,
+    mention_names: &dyn Fn(&str) -> String,
+) -> crate::transcript::Row {
     let who = if message.from_me {
-        (view.mention_names)(&message.sender)
+        mention_names(&message.sender)
     } else {
-        (view.names_or)(&message.sender, message.sender_name.as_deref())
+        names_or(&message.sender, message.sender_name.as_deref())
     };
     let marker = match &message.content {
         Content::Image { .. } => Some("[photo]".to_owned()),
@@ -3122,13 +4138,7 @@ fn transcript_row(
         let listed: Vec<String> = message
             .reactions
             .iter()
-            .map(|reaction| {
-                format!(
-                    "{} {}",
-                    reaction.emoji,
-                    (view.names_or)(&reaction.sender, None)
-                )
-            })
+            .map(|reaction| format!("{} {}", reaction.emoji, names_or(&reaction.sender, None)))
             .collect();
         format!(" ({})", listed.join(", "))
     };
@@ -3136,8 +4146,16 @@ fn transcript_row(
         let name = quoted
             .sender_name
             .clone()
-            .unwrap_or_else(|| (view.names_or)(&quoted.sender, None));
-        let summary = markup::plain(&quoted.summary, &quote_mentions(view, quoted));
+            .unwrap_or_else(|| names_or(&quoted.sender, None));
+        let mentions: Vec<markup::Mention> = quoted
+            .mentions
+            .iter()
+            .map(|mention| markup::Mention {
+                user: mention.user.clone(),
+                name: mention_names(&mention.id),
+            })
+            .collect();
+        let summary = markup::plain(&quoted.summary, &mentions);
         let short: String = summary.chars().take(48).collect();
         let cut = if summary.chars().count() > 48 {
             "…"
@@ -3169,9 +4187,44 @@ pub fn edge_scroll(pointer: f32, top: f32, bottom: f32) -> f32 {
     }
 }
 
+/// A call's menu: calling back, in a chat that can take a call.
+fn call_menu(ui: &mut egui::Ui, view: &View<'_>, group: bool, actions: &mut Vec<Action>) {
+    let palette = view.palette;
+    let chat = &view.chat.id;
+    if group || view.chat.kind != crate::model::ChatKind::Direct {
+        ui.add_enabled_ui(false, |ui| {
+            widgets::menu_item(
+                ui,
+                &palette,
+                Some(Icon::Phone),
+                &crate::i18n::gettext(view.locale, "Group calls happen on the phone"),
+            );
+        });
+        return;
+    }
+    if widgets::menu_item(
+        ui,
+        &palette,
+        Some(Icon::Phone),
+        &crate::i18n::gettext(view.locale, "Voice call"),
+    ) {
+        actions.push(Action::StartCall(chat.clone()));
+    }
+    if widgets::menu_item(
+        ui,
+        &palette,
+        Some(Icon::Video),
+        &crate::i18n::gettext(view.locale, "Video call"),
+    ) {
+        actions.push(Action::StartVideoCall(chat.clone()));
+    }
+}
+
 /// Starts a reply when the response was double-clicked, as the menu's "Reply".
 fn reply_on_double_click(response: &egui::Response, message: &Message, actions: &mut Vec<Action>) {
-    if response.double_clicked() && !matches!(message.content, Content::Revoked) {
+    if response.double_clicked()
+        && !matches!(message.content, Content::Revoked | Content::Call { .. })
+    {
         actions.push(Action::Reply(message.id.clone()));
     }
 }
@@ -3290,25 +4343,78 @@ fn speed_menu_row(
     );
 }
 
+/// Whether `message` draws without a bubble around it: stickers, round video
+/// messages, carousels, and in the Messages style a lone picture.
+fn bubbleless(palette: &Palette, message: &Message) -> bool {
+    matches!(
+        &message.content,
+        Content::Sticker { .. } | Content::Video { note: true, .. }
+    ) || matches!(&message.content, Content::Interactive { card: Some(card), .. } if !card.carousel.is_empty())
+        || bare_picture(palette, message)
+}
+
+/// Whether `messages[index]` ends its run: the next message is from the other
+/// side, another sender, or another day.
+fn last_of_run(messages: &[Message], index: usize) -> bool {
+    let message = &messages[index];
+    messages.get(index + 1).is_none_or(|next| {
+        !same_run(message, next)
+            || crate::util::day_key(message.timestamp) != crate::util::day_key(next.timestamp)
+    })
+}
+
+/// Whether `messages[index]` is the last bubble of its run, which Messages
+/// tails: messages drawn without one after it, a lone photo or a sticker,
+/// leave the tail to it.
+fn last_bubble_of_run(palette: &Palette, messages: &[Message], index: usize) -> bool {
+    let message = &messages[index];
+    !messages[index + 1..]
+        .iter()
+        .take_while(|next| {
+            same_run(message, next)
+                && crate::util::day_key(message.timestamp) == crate::util::day_key(next.timestamp)
+        })
+        .any(|next| !bubbleless(palette, next))
+}
+
+/// Whether `next` continues the run `message` belongs to: the same side,
+/// and in a group the same sender.
+fn same_run(message: &Message, next: &Message) -> bool {
+    message.from_me == next.from_me && (message.from_me || message.sender == next.sender)
+}
+
+/// Room around a bubble's contents: none around a picture that stands
+/// without one, Messages' insets in its style, WhatsApp's otherwise.
+fn bubble_margin(palette: &Palette, message: &Message, over_picture: bool) -> Margin {
+    if bare_picture(palette, message) {
+        Margin::ZERO
+    } else if palette.bubbles == theme::BubbleStyle::Messages {
+        MESSAGES_BUBBLE_MARGIN
+    } else {
+        Margin {
+            left: 10,
+            right: 10,
+            top: 6,
+            bottom: if over_picture { 6 } else { 5 },
+        }
+    }
+}
+
 /// Draws a message bubble and its menu.
+#[allow(clippy::too_many_arguments)]
 fn bubble_frame(
     ui: &mut egui::Ui,
     view: &View<'_>,
     message: &Message,
+    album: Option<&[Message]>,
     show_sender: bool,
-    first_in_run: bool,
+    tailed: bool,
     max_width: f32,
     actions: &mut Vec<Action>,
 ) -> egui::Response {
     let palette = view.palette;
     let own = message.from_me;
-    let carousel = matches!(&message.content, Content::Interactive { card: Some(card), .. } if !card.carousel.is_empty());
-    // Stickers and round video messages draw without a bubble.
-    let bare = matches!(
-        message.content,
-        Content::Sticker { .. } | Content::Video { note: true, .. }
-    );
-    let fill = if carousel || bare {
+    let fill = if bubbleless(&palette, message) {
         Color32::TRANSPARENT
     } else if own {
         palette.bubble_out
@@ -3325,21 +4431,17 @@ fn bubble_frame(
     let early = previous.map(|rect| ui.interact(rect, bubble_id, Sense::CLICK));
     // Painted once the contents are measured, beneath them.
     let backdrop = ui.painter().add(egui::Shape::Noop);
-    let tail = (first_in_run && fill != Color32::TRANSPARENT).then_some(if own {
+    let tail = (tailed && fill != Color32::TRANSPARENT).then_some(if own {
         widgets::Side::Right
     } else {
         widgets::Side::Left
     });
     // A picture without a caption carries its time over its corner, so
     // the bubble closes under it as evenly as it opens above it.
-    let over_picture = time_over_picture(message);
+    let over_picture = album.is_none() && time_over_picture(message);
+    let mut tiles: Vec<(Rect, String)> = Vec::new();
     let inner = Frame::new()
-        .inner_margin(Margin {
-            left: 10,
-            right: 10,
-            top: 6,
-            bottom: if over_picture { 6 } else { 5 },
-        })
+        .inner_margin(bubble_margin(&palette, message, over_picture))
         .show(ui, |ui| {
             ui.set_max_width(max_width);
             ui.spacing_mut().item_spacing.y = 4.0;
@@ -3359,7 +4461,7 @@ fn bubble_frame(
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if response.clicked() {
-                    actions.push(Action::ShowDialog(Dialog::ChatInfo(message.sender.clone())));
+                    actions.push(Action::OpenInfo(message.sender.clone()));
                 }
             }
             // Reserve the label's line now and paint it once the contents
@@ -3369,22 +4471,47 @@ fn bubble_frame(
             // Cards share the bubble's settled width: at least CARD_WIDTH and
             // no more than the cap. Text spans that width and stays left-aligned.
             // Bubbles without cards use the natural text width.
-            let cap = ((max_width - 20.0).min(ui.available_width())).max(0.0);
-            let reserve = footer_width(ui, message);
-            let settled = settled_width(ui, view, message, cap);
-            let slot = match settled {
-                Some(width) => {
-                    if let Some(quoted) = &message.quoted {
-                        quote_block(ui, view, message, quoted, width, actions);
+            let inset = if palette.bubbles == theme::BubbleStyle::Messages
+                && !bare_picture(&palette, message)
+            {
+                MESSAGES_BUBBLE_MARGIN.sum().x
+            } else {
+                20.0
+            };
+            let cap = ((max_width - inset).min(ui.available_width())).max(0.0);
+            let last = album
+                .and_then(|messages| messages.last())
+                .unwrap_or(message);
+            // An album's footer is its last member's, marks included.
+            let starred = view.starred.is_some_and(|ids| ids.contains(&last.id));
+            let pinned = view.pins.is_some_and(|ids| ids.contains(&last.id));
+            let reserve = footer_width(ui, last, starred, pinned);
+            let settled = album
+                .map(|_| CARD_WIDTH.min(cap))
+                .or_else(|| settled_width(ui, view, message, cap));
+            let slot = if let Some(messages) = album {
+                for member in messages {
+                    if let Some(quoted) = &member.quoted {
+                        quote_block(ui, view, member, quoted, settled.unwrap_or(cap), actions);
                     }
-                    content(ui, view, message, width, reserve, actions)
                 }
-                None => content(ui, view, message, cap, reserve, actions),
+                tiles = album_content(ui, view, messages, settled.unwrap_or(cap), actions);
+                None
+            } else {
+                match settled {
+                    Some(width) => {
+                        if let Some(quoted) = &message.quoted {
+                            quote_block(ui, view, message, quoted, width, actions);
+                        }
+                        content(ui, view, message, width, reserve, actions)
+                    }
+                    None => content(ui, view, message, cap, reserve, actions),
+                }
             };
             if over_picture && let Some(picture) = slot {
-                footer_over_picture(ui, &palette, message, picture);
+                footer_over_picture(ui, view, message, picture, starred, pinned, actions);
             } else {
-                footer(ui, &palette, message, slot);
+                footer(ui, view, last, slot, starred, pinned, actions);
             }
             if matches!(message.content, Content::Poll { .. }) {
                 super::polls::results_button(
@@ -3412,12 +4539,23 @@ fn bubble_frame(
     if fill != Color32::TRANSPARENT && ui.is_rect_visible(inner.response.rect) {
         ui.painter().set(
             backdrop,
-            widgets::bubble_shape(&palette, inner.response.rect, fill, tail),
+            widgets::bubble_shape(
+                &palette,
+                inner.response.rect,
+                fill,
+                tail,
+                ui.ctx().pixels_per_point(),
+                // The transcript's viewport: own balloons shade down it.
+                ui.clip_rect().y_range(),
+            ),
         );
     }
     ui.ctx()
         .data_mut(|data| data.insert_temp(rect_id, inner.response.rect));
     let bubble = early.unwrap_or_else(|| ui.interact(inner.response.rect, bubble_id, Sense::CLICK));
+    if view.selecting {
+        return bubble;
+    }
     theme::reveal_focus(&bubble);
     theme::focus_outline(ui, bubble.id, inner.response.rect, 10.0);
     if ui.ctx().data(|data| {
@@ -3467,21 +4605,47 @@ fn bubble_frame(
                 .layer_id_at(pos)
                 .is_none_or(|layer| layer == bubble.layer_id)
         });
-    let force_menu = view.open_menu == Some(message.id.as_str());
-    let quick = quick_reactions(message, view.reaction_emoji).len() as f32 + 1.0;
-    let width = widgets::menu_width(
-        ui,
-        &[
-            "Delete for everyone",
-            "Show in folder",
-            "Copy message ID",
-            &crate::i18n::gettext(view.locale, "Open in system player"),
-            &crate::i18n::gettext(view.locale, "Message info"),
-            &crate::i18n::gettext(view.locale, "Reload earlier messages"),
-        ],
-        true,
-    )
-    .max(quick * 36.0 + 12.0);
+    // In an album the menu belongs to the member under the pointer, so a
+    // reply, reaction, forward or deletion reaches that item, not the first.
+    let target_id = bubble_id.with("album-target");
+    if album.is_some() && right_clicked {
+        let pointer = ui.input(|input| input.pointer.interact_pos());
+        let hit = tiles
+            .iter()
+            .find(|(rect, _)| pointer.is_some_and(|pos| rect.contains(pos)))
+            .map(|(_, id)| id.clone());
+        ui.ctx().data_mut(|data| {
+            if let Some(id) = hit {
+                data.insert_temp(target_id, id);
+            } else {
+                data.remove::<String>(target_id);
+            }
+        });
+    }
+    if let Some(members) = album
+        && let Some(opened) = view.open_menu
+        && members.iter().any(|member| member.id == opened)
+    {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(target_id, opened.to_owned()));
+    }
+    let menu_target = album
+        .and_then(|members| {
+            let id = ui.ctx().data(|data| data.get_temp::<String>(target_id))?;
+            members.iter().find(|member| member.id == id)
+        })
+        .unwrap_or(message);
+    let force_menu = match album {
+        Some(members) => view
+            .open_menu
+            .is_some_and(|opened| members.iter().any(|member| member.id == opened)),
+        None => view.open_menu == Some(message.id.as_str()),
+    };
+    let reacting = reacting
+        || (album.is_some()
+            && view.reaction_menu
+            && view.reaction == Some(menu_target.id.as_str()));
+    let width = menu_width(ui, view.locale, view.reaction_emoji, menu_target);
     let keyboard_clicked =
         bubble.clicked() && bubble.has_focus() && !ui.input(|input| input.pointer.any_click());
     let open = if right_clicked || force_menu || reacting || keyboard_clicked {
@@ -3519,7 +4683,7 @@ fn bubble_frame(
         popup.at_pointer_fixed()
     };
     let menu = popup.show(|ui| {
-        context_menu(ui, view, message, actions);
+        context_menu(ui, view, menu_target, MenuOrigin::Chat, actions);
     });
     if let Some(menu) = menu {
         ui.ctx()
@@ -3632,7 +4796,9 @@ fn natural_text_width(ui: &egui::Ui, view: &View<'_>, message: &Message, cap: f3
         .map(|row| row.row.size.x)
         .fold(0.0, f32::max);
     let last = laid.galley.rows.last().map_or(0.0, |row| row.row.size.x);
-    let reserve = footer_width(ui, message);
+    let starred = view.starred.is_some_and(|ids| ids.contains(&message.id));
+    let pinned = view.pins.is_some_and(|ids| ids.contains(&message.id));
+    let reserve = footer_width(ui, message, starred, pinned);
     Some(if last + 8.0 + reserve <= cap {
         widest.max(last + 8.0 + reserve)
     } else {
@@ -3644,6 +4810,40 @@ fn natural_text_width(ui: &egui::Ui, view: &View<'_>, message: &Message, cap: f3
 const QUOTE_BAR: f32 = 4.0;
 /// Corner radius of a quote.
 const QUOTE_RADIUS: u8 = 6;
+
+/// Draws a stored quote and routes navigation to its source conversation.
+/// How a quoted reply is coloured inside its bubble.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct QuoteColours {
+    fill: Color32,
+    bar: Color32,
+    name: Color32,
+    text: Color32,
+}
+
+/// The quote's colours. On your own Messages balloon, iMessage blue, it is
+/// all white, as Messages draws what sits on that blue: a bold white name,
+/// its text at Apple's secondary 60% white
+/// (`CKUITheme.blue_balloonTranslationSecondaryTextColor`), the bar at 60%
+/// and the fill a 15% white wash over the bubble. Elsewhere the bar and name
+/// take `tint`, the quoted sender's colour, over the window's.
+fn quote_colours(palette: &Palette, own: bool, tint: impl FnOnce() -> Color32) -> QuoteColours {
+    if own && palette.bubbles == theme::BubbleStyle::Messages {
+        return QuoteColours {
+            fill: Color32::WHITE.gamma_multiply(0.15),
+            bar: Color32::WHITE.gamma_multiply(0.6),
+            name: Color32::WHITE,
+            text: Color32::WHITE.gamma_multiply(0.6),
+        };
+    }
+    let tint = tint();
+    QuoteColours {
+        fill: palette.window.gamma_multiply(0.35),
+        bar: tint,
+        name: tint,
+        text: palette.secondary,
+    }
+}
 
 fn quote_block(
     ui: &mut egui::Ui,
@@ -3668,18 +4868,20 @@ fn quote_block(
     } else {
         palette.bubble_in
     };
-    let tint = theme::readable_on(
-        bubble,
-        if mine {
-            palette.accent
-        } else {
-            palette.sender(crate::util::hue(&quoted.sender))
-        },
-        palette.text,
-        3.0,
-    );
+    let colours = quote_colours(&palette, message.from_me, || {
+        theme::readable_on(
+            bubble,
+            if mine {
+                palette.accent
+            } else {
+                palette.sender(crate::util::hue(&quoted.sender))
+            },
+            palette.text,
+            3.0,
+        )
+    });
     let response = Frame::new()
-        .fill(palette.window.gamma_multiply(0.35))
+        .fill(colours.fill)
         .corner_radius(CornerRadius::same(QUOTE_RADIUS))
         .inner_margin(Margin {
             left: QUOTE_BAR as i8 + 7,
@@ -3697,8 +4899,8 @@ fn quote_block(
                 |ui| {
                     ui.set_width(inner_width);
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    widgets::rich_text(ui, &who, theme::semibold(12.5), tint);
-                    widgets::rich_text(ui, &summary, theme::regular(12.5), palette.secondary);
+                    widgets::rich_text(ui, &who, theme::semibold(12.5), colours.name);
+                    widgets::rich_text(ui, &summary, theme::regular(12.5), colours.text);
                 },
             );
         })
@@ -3713,7 +4915,7 @@ fn quote_block(
             ne: 0,
             se: 0,
         },
-        tint,
+        colours.bar,
     );
     ui.ctx().data_mut(|data| {
         data.insert_temp(
@@ -3729,7 +4931,14 @@ fn quote_block(
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
-        actions.push(Action::ScrollTo(quoted.id.clone()));
+        if let Some(chat) = &quoted.chat {
+            actions.push(Action::OpenMessage {
+                chat: chat.clone(),
+                message: quoted.id.clone(),
+            });
+        } else {
+            actions.push(Action::ScrollTo(quoted.id.clone()));
+        }
     }
 }
 
@@ -3815,18 +5024,31 @@ fn paint_forwarded_label(
     rect
 }
 
-/// Width of the message footer.
-fn footer_width(ui: &egui::Ui, message: &Message) -> f32 {
-    let font = theme::regular(11.0);
-    let time = ui
-        .painter()
+/// Painted size of the star mark in the bubble footer.
+const FOOTER_MARK: f32 = 13.0;
+/// One gap: time to the mark.
+const FOOTER_MARK_GAP: f32 = 8.0;
+/// Room one visible mark keeps next to the clock.
+const FOOTER_MARK_SLOT: f32 = FOOTER_MARK + FOOTER_MARK_GAP;
+const FOOTER_STAR: Color32 = Color32::from_rgb(0xEA, 0xB3, 0x08);
+
+/// The clock's own width at the footer's size: the floor a footer starts from,
+/// and the one part of it that depends on the reader's clock format.
+fn clock_width(ui: &egui::Ui, message: &Message) -> f32 {
+    ui.painter()
         .layout_no_wrap(
             crate::util::clock(message.timestamp),
-            font.clone(),
+            theme::regular(11.0),
             Color32::WHITE,
         )
         .size()
-        .x;
+        .x
+}
+
+/// Width of the message footer, including the room its marks take.
+fn footer_width(ui: &egui::Ui, message: &Message, starred: bool, pinned: bool) -> f32 {
+    let font = theme::regular(11.0);
+    let time = clock_width(ui, message);
     let edited = if message.edited {
         ui.painter()
             .layout_no_wrap("edited".to_owned(), font, Color32::WHITE)
@@ -3845,7 +5067,12 @@ fn footer_width(ui: &egui::Ui, message: &Message) -> f32 {
     } else {
         0.0
     };
-    time + edited + not_sent + if message.from_me { 19.0 } else { 0.0 }
+    // Only a message that carries a mark reserves its slot, as WhatsApp does:
+    // a plain footer is the clock and the ticks alone. Starring or pinning
+    // grows that bubble's footer by one slot each.
+    let marks =
+        if starred { FOOTER_MARK_SLOT } else { 0.0 } + if pinned { FOOTER_MARK_SLOT } else { 0.0 };
+    time + edited + not_sent + if message.from_me { 19.0 } else { 0.0 } + marks
 }
 
 /// Whether the message's time and ticks sit over its picture rather than
@@ -3854,13 +5081,70 @@ fn time_over_picture(message: &Message) -> bool {
     matches!(message.content, Content::Image { caption: None, .. })
 }
 
+/// The ticks a message in this view shows (see [`display_delivery`]).
+fn shown_delivery(view: &View<'_>, message: &Message) -> Delivery {
+    display_delivery(
+        message.status,
+        message.from_me,
+        view.chat.kind,
+        view.account_receipts_off,
+    )
+}
+
+/// A DM read receipt is not visible in WhatsApp when our account has read
+/// receipts off. Keep the archived status intact, but match that display here.
+pub(super) fn display_delivery(
+    status: Delivery,
+    from_me: bool,
+    chat_kind: crate::model::ChatKind,
+    account_receipts_off: bool,
+) -> Delivery {
+    if account_receipts_off
+        && chat_kind == crate::model::ChatKind::Direct
+        && from_me
+        && status == Delivery::Read
+    {
+        Delivery::Delivered
+    } else {
+        status
+    }
+}
+
+/// Whether a picture stands without a bubble, as Messages draws a photo
+/// with nothing else in its message: it takes the bubble's round shape
+/// itself. A quote or the forwarded label keeps the bubble around it.
+fn bare_picture(palette: &Palette, message: &Message) -> bool {
+    palette.bubbles == theme::BubbleStyle::Messages
+        && time_over_picture(message)
+        && message.quoted.is_none()
+        && !message.forwarded
+}
+
+/// How round a picture's corners are: a bubble's, when it has none.
+fn picture_radius(palette: &Palette, message: &Message) -> f32 {
+    if bare_picture(palette, message) {
+        f32::from(widgets::MESSAGES_BUBBLE_RADIUS)
+    } else {
+        6.0
+    }
+}
+
 /// Space between a picture's edges and the time drawn over it: the scrim
 /// around the time keeps a few points clear of the rounded corner.
 const OVER_PICTURE_INSET: Vec2 = vec2(10.0, 6.0);
 
 /// Paints the time and ticks over the bottom corner of a picture without a
 /// caption, in white on a soft dark scrim so they read on any picture.
-fn footer_over_picture(ui: &mut egui::Ui, palette: &Palette, message: &Message, picture: Rect) {
+fn footer_over_picture(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    picture: Rect,
+    starred: bool,
+    pinned: bool,
+    actions: &mut Vec<Action>,
+) {
+    let palette = &view.palette;
     let font = theme::regular(11.0);
     let time =
         ui.painter()
@@ -3870,8 +5154,12 @@ fn footer_over_picture(ui: &mut egui::Ui, palette: &Palette, message: &Message, 
             .layout_no_wrap(NOT_SENT.to_owned(), theme::medium(11.0), Color32::WHITE)
     });
     let tick_width = if message.from_me { 19.0 } else { 0.0 };
-    let width =
-        time.size().x + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0) + tick_width;
+    let marks =
+        if starred { FOOTER_MARK_SLOT } else { 0.0 } + if pinned { FOOTER_MARK_SLOT } else { 0.0 };
+    let width = time.size().x
+        + failed.as_ref().map_or(0.0, |galley| galley.size().x + 6.0)
+        + tick_width
+        + marks;
     let row = Rect::from_min_max(
         pos2(
             picture.right() - OVER_PICTURE_INSET.x - width,
@@ -3887,7 +5175,13 @@ fn footer_over_picture(ui: &mut egui::Ui, palette: &Palette, message: &Message, 
     let mut x = row.right();
     if message.from_me {
         let ticks = Rect::from_center_size(pos2(x - 7.5, row.center().y), Vec2::splat(15.0));
-        widgets::ticks_in(ui, palette, ticks, message.status, Color32::WHITE);
+        widgets::ticks_in(
+            ui,
+            palette,
+            ticks,
+            shown_delivery(view, message),
+            Color32::WHITE,
+        );
         x -= tick_width;
     }
     x -= time.size().x;
@@ -3896,6 +5190,9 @@ fn footer_over_picture(ui: &mut egui::Ui, palette: &Palette, message: &Message, 
         time,
         Color32::WHITE,
     );
+    let status =
+        Rect::from_x_y_ranges(x..=row.right(), row.center().y - 7.5..=row.center().y + 7.5);
+    status_opens_info(ui, view, message, status, actions);
     if let Some(failed) = failed {
         x -= failed.size().x + 6.0;
         let label = Rect::from_min_size(
@@ -3914,6 +5211,32 @@ fn footer_over_picture(ui: &mut egui::Ui, palette: &Palette, message: &Message, 
         });
         response.on_hover_text(NOT_SENT_HINT);
     }
+    if pinned {
+        x -= FOOTER_MARK_SLOT;
+        theme::paint_icon(
+            ui,
+            Icon::Pin,
+            Rect::from_center_size(
+                pos2(x + FOOTER_MARK / 2.0, row.center().y),
+                Vec2::splat(FOOTER_MARK),
+            ),
+            FOOTER_MARK,
+            Color32::WHITE,
+        );
+    }
+    if starred {
+        x -= FOOTER_MARK_SLOT;
+        theme::paint_icon(
+            ui,
+            Icon::StarFill,
+            Rect::from_center_size(
+                pos2(x + FOOTER_MARK / 2.0, row.center().y),
+                Vec2::splat(FOOTER_MARK),
+            ),
+            FOOTER_MARK,
+            FOOTER_STAR,
+        );
+    }
     ui.ctx().data_mut(|data| {
         data.insert_temp(footer_id(&message.chat, &message.id), row);
     });
@@ -3924,12 +5247,60 @@ pub fn footer_id(chat: &str, message: &str) -> egui::Id {
     bubble_id(chat, message).with("footer")
 }
 
+/// Whether "Message info" has receipts to show: our own sent message.
+fn has_message_info(message: &Message) -> bool {
+    message.from_me
+        && !matches!(message.content, Content::Revoked)
+        && !matches!(
+            message.status,
+            Delivery::None | Delivery::Pending | Delivery::Failed
+        )
+}
+
+/// Clicking our time and ticks opens "Message info", as in WhatsApp.
+fn status_opens_info(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    status: Rect,
+    actions: &mut Vec<Action>,
+) {
+    if !has_message_info(message) {
+        return;
+    }
+    let label = crate::i18n::gettext(view.locale, "Message info");
+    let response = ui.interact(
+        status.expand(2.0),
+        ui.id().with(("status", &message.id)),
+        Sense::click(),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(&*label);
+    if response.clicked() {
+        actions.push(Action::ShowDialog(Dialog::MessageInfo {
+            chat: message.chat.clone(),
+            message: message.id.clone(),
+        }));
+    }
+}
+
 fn not_sent(message: &Message) -> bool {
     message.from_me && message.status == Delivery::Failed
 }
 
 /// Paints the time and ticks at the bubble's right edge without widening it.
-fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<Rect>) {
+fn footer(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    slot: Option<Rect>,
+    starred: bool,
+    pinned: bool,
+    actions: &mut Vec<Action>,
+) {
+    let palette = &view.palette;
     let font = theme::regular(11.0);
     let time = ui.painter().layout_no_wrap(
         crate::util::clock(message.timestamp),
@@ -3969,7 +5340,7 @@ fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<
     let mut x = rect.right();
     if message.from_me {
         let ticks = Rect::from_center_size(pos2(x - 7.5, rect.center().y), Vec2::splat(15.0));
-        widgets::ticks(ui, palette, ticks, message.status);
+        widgets::ticks(ui, palette, ticks, shown_delivery(view, message));
         x -= tick_width;
     }
     x -= time.size().x;
@@ -3978,6 +5349,25 @@ fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<
         time,
         palette.secondary,
     );
+    let status = Rect::from_x_y_ranges(
+        x..=rect.right(),
+        rect.center().y - 7.5..=rect.center().y + 7.5,
+    );
+    status_opens_info(ui, view, message, status, actions);
+    if pinned {
+        // Left of the clock, in the room `footer_width` counted for it.
+        x -= FOOTER_MARK_SLOT;
+        theme::paint_icon(
+            ui,
+            Icon::Pin,
+            Rect::from_center_size(
+                pos2(x + FOOTER_MARK / 2.0, rect.center().y),
+                Vec2::splat(FOOTER_MARK),
+            ),
+            FOOTER_MARK,
+            palette.secondary,
+        );
+    }
     if let Some(edited) = edited {
         x -= edited.size().x + 4.0;
         ui.painter().galley(
@@ -4005,6 +5395,19 @@ fn footer(ui: &mut egui::Ui, palette: &Palette, message: &Message, slot: Option<
             egui::WidgetInfo::labeled(egui::WidgetType::Label, true, NOT_SENT_HINT)
         });
         response.on_hover_text(NOT_SENT_HINT);
+    }
+    if starred {
+        x -= FOOTER_MARK_SLOT;
+        theme::paint_icon(
+            ui,
+            Icon::StarFill,
+            Rect::from_center_size(
+                pos2(x + FOOTER_MARK / 2.0, rect.center().y),
+                Vec2::splat(FOOTER_MARK),
+            ),
+            FOOTER_MARK,
+            FOOTER_STAR,
+        );
     }
 }
 
@@ -4090,6 +5493,115 @@ pub(crate) fn reaction_choice(current: Option<&str>, emoji: &str) -> String {
     }
 }
 
+/// Width a message menu needs: its longest entry, or the quick-reaction row
+/// when that is wider. Both the bubble and a starred row use it, so the two
+/// menus come out the same size.
+pub(crate) fn menu_width(
+    ui: &egui::Ui,
+    locale: crate::i18n::Locale,
+    reaction_emoji: &[(String, u32)],
+    message: &Message,
+) -> f32 {
+    let quick = quick_reactions(message, reaction_emoji).len() as f32 + 1.0;
+    let labels = message_menu_labels(locale);
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    widgets::menu_width(ui, &refs, true).max(quick * 36.0 + 12.0)
+}
+
+/// Every label the message menu can show. The menu is as wide as the longest
+/// one, so Star and Unstar belong here: a long translation is otherwise cut.
+fn message_menu_labels(locale: crate::i18n::Locale) -> Vec<String> {
+    vec![
+        "Delete for everyone".into(),
+        "Show in folder".into(),
+        "Copy message ID".into(),
+        crate::i18n::gettext(locale, "Open in system player").into_owned(),
+        crate::i18n::gettext(locale, "Message info").into_owned(),
+        crate::i18n::gettext(locale, "Reload earlier messages").into_owned(),
+        crate::i18n::gettext(locale, "Unstar").into_owned(),
+        crate::i18n::gettext(locale, "Star").into_owned(),
+    ]
+}
+
+/// Where a message menu was opened from. A starred row has no composer, no
+/// selection bar, and no revoke window of its own, so the entries that need one
+/// ask for the chat to be opened at the message first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuOrigin {
+    Chat,
+    List,
+}
+
+/// How a left-list row's message is marked, for the menu's Star label.
+#[derive(Clone, Copy)]
+pub(crate) struct Marks {
+    pub starred: bool,
+}
+
+/// The message menu for a row drawn outside the conversation: the starred
+/// list. It is the chat's own menu, with the marks the list already knows, so
+/// both places offer exactly the same entries.
+pub(crate) fn list_menu(
+    app: &App,
+    ui: &mut egui::Ui,
+    chat: &Chat,
+    message: &Message,
+    marks: Marks,
+    actions: &mut Vec<Action>,
+) {
+    let stars: HashSet<String> = marks
+        .starred
+        .then(|| message.id.clone())
+        .into_iter()
+        .collect();
+    let names_or = |id: &str, hint: Option<&str>| app.display_name_or(id, hint);
+    let mention_names = |id: &str| app.mention_name(id);
+    let avatars = HashMap::new();
+    let keyboard_navigation = std::cell::Cell::new(false);
+    let view = View {
+        palette: app.palette,
+        locale: app.locale,
+        chat,
+        me: app.me.as_deref(),
+        auto_download: app.settings.auto_download,
+        connected: app.link.is_connected(),
+        poll_voting: &app.poll_voting,
+        interactive_pending: &app.interactive_sending,
+        // Nothing scrolls, highlights, or selects in a list row.
+        anchor: None,
+        open_menu: None,
+        reaction: None,
+        reaction_menu: false,
+        reaction_emoji: &app.settings.reaction_emoji,
+        keyboard_navigation: &keyboard_navigation,
+        names_or: &names_or,
+        mention_names: &mention_names,
+        avatars: &avatars,
+        contacts: &app.contacts,
+        now: crate::util::now(),
+        // A row drawn outside the conversation holds still.
+        animate: false,
+        player: &app.player,
+        video: &app.video,
+        account_receipts_off: app.account_receipts_off,
+        copy_rows: Some(app.copy_rows.as_ref()),
+        selecting: false,
+        motion_playing: None,
+        starred: marks.starred.then_some(&stars),
+        pins: app.pins.get(&message.chat),
+        pin_notices: &[],
+        transcriber: &app.transcriber,
+        transcription_ready: app.settings.transcription_enabled
+            && crate::transcription::selected_model(&app.settings).is_some_and(|model| {
+                crate::transcription::model_downloaded(
+                    model,
+                    &crate::transcription::models_dir(&app.dirs),
+                )
+            }),
+    };
+    context_menu(ui, &view, message, MenuOrigin::List, actions);
+}
+
 /// Quick reactions plus our current reaction when needed.
 fn quick_reactions<'a>(message: &'a Message, preferred: &'a [(String, u32)]) -> Vec<&'a str> {
     let mut list = Vec::new();
@@ -4113,9 +5625,102 @@ fn quick_reactions<'a>(message: &'a Message, preferred: &'a [(String, u32)]) -> 
     list
 }
 
-fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: &mut Vec<Action>) {
+/// The file the menu's viewer item would open, when the message has one to
+/// show.
+///
+/// The album decides what belongs in the viewer: a sticker, a GIF or a card's
+/// image is not in it, so none of them offers the item. The recorded path has
+/// to still be a file: a path the archive kept after the file was deleted or
+/// moved elsewhere would open a viewer with nothing to show, and the click
+/// would fall back to opening a file that is not there.
+fn viewer_file(message: &Message) -> Option<&Path> {
+    message.content.gallery_kind()?;
+    message
+        .content
+        .media()
+        .and_then(|media| media.path.as_deref())
+        .filter(|path| crate::image_preview::can_view(path) && path.is_file())
+}
+
+/// Checks every selected message's revoke eligibility with one scan of loaded history.
+fn selection_can_revoke(messages: &[Message], selected: &[String], now: i64) -> bool {
+    if selected.is_empty() {
+        return false;
+    }
+    let mut remaining: std::collections::HashSet<&str> =
+        selected.iter().map(String::as_str).collect();
+    for message in messages {
+        if remaining.remove(message.id.as_str()) {
+            if !message.from_me
+                || matches!(message.content, Content::Revoked)
+                || now - message.timestamp > crate::app::REVOKE_WINDOW.as_secs() as i64
+            {
+                return false;
+            }
+            if remaining.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Draws batch actions for the selected messages, including separate deletion choices.
+fn selection_menu(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    messages: &[Message],
+    selected: &[String],
+    actions: &mut Vec<Action>,
+) {
+    selection_delete_items(
+        ui,
+        &view.palette,
+        &view.chat.id,
+        selection_can_revoke(messages, selected, view.now),
+        selected,
+        actions,
+    );
+}
+
+/// The two ways to delete a selection, shared by the selection's context
+/// menu and the selection bar's Delete menu. Each opens the confirmation.
+fn selection_delete_items(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    chat: &str,
+    can_revoke: bool,
+    selected: &[String],
+    actions: &mut Vec<Action>,
+) {
+    for (label, for_everyone, enabled) in [
+        ("Delete for everyone", true, can_revoke),
+        ("Delete for me", false, !selected.is_empty()),
+    ] {
+        if widgets::menu_item_enabled(ui, palette, Some(Icon::Trash), label, enabled) {
+            actions.push(Action::ShowDialog(Dialog::ConfirmDeleteSelection {
+                chat: chat.to_owned(),
+                messages: selected.to_vec(),
+                for_everyone,
+            }));
+        }
+    }
+}
+
+/// Offers actions supported by the selected message, including private replies for eligible group senders.
+fn context_menu(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    origin: MenuOrigin,
+    actions: &mut Vec<Action>,
+) {
     let palette = view.palette;
     let chat = &view.chat.id;
+    if let Content::Call { group, .. } = message.content {
+        call_menu(ui, view, group, actions);
+        return;
+    }
     let mine = own_reaction(message);
     ui.allocate_ui_with_layout(
         vec2(ui.available_width(), 34.0),
@@ -4190,7 +5795,60 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
     if !matches!(message.content, Content::Revoked)
         && widgets::menu_item(ui, &palette, Some(Icon::Reply), "Reply")
     {
+        if matches!(origin, MenuOrigin::List) {
+            actions.push(Action::OpenMessage {
+                chat: chat.clone(),
+                message: message.id.clone(),
+            });
+        }
         actions.push(Action::Reply(message.id.clone()));
+    }
+    // From the starred list the source chat is not on screen, and the
+    // private reply starts from the group the reader is looking at.
+    if !matches!(origin, MenuOrigin::List)
+        && message.private_reply_recipient().is_some()
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Reply),
+            &crate::i18n::gettext(view.locale, "Reply privately"),
+        )
+    {
+        actions.push(Action::ReplyPrivately {
+            chat: chat.clone(),
+            message: message.id.clone(),
+        });
+    }
+    let starred = view.starred.is_some_and(|ids| ids.contains(&message.id));
+    let star_label = if starred {
+        crate::i18n::gettext(view.locale, "Unstar")
+    } else {
+        crate::i18n::gettext(view.locale, "Star")
+    };
+    if !matches!(message.content, Content::Revoked)
+        && widgets::menu_item(ui, &palette, Some(Icon::Star), &star_label)
+    {
+        actions.push(Action::SetStar {
+            chat: chat.clone(),
+            message: message.id.clone(),
+            starred: !starred,
+        });
+        ui.close();
+    }
+    let pinned = view.pins.is_some_and(|ids| ids.contains(&message.id));
+    let pin_label = if pinned {
+        crate::i18n::gettext(view.locale, "Unpin message")
+    } else {
+        crate::i18n::gettext(view.locale, "Pin message")
+    };
+    if !matches!(message.content, Content::Revoked)
+        && widgets::menu_item(ui, &palette, Some(Icon::Pin), &pin_label)
+    {
+        actions.push(Action::SetMessagePinned {
+            chat: chat.clone(),
+            message: message.id.clone(),
+            pinned: !pinned,
+        });
     }
     if crate::app::can_select(&message.content)
         && widgets::menu_item(ui, &palette, Some(Icon::Forward), "Forward")
@@ -4200,9 +5858,33 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
             messages: vec![message.id.clone()],
         }));
     }
+    // A photo opens the viewer on its own click; a clip plays in its bubble
+    // there, so this is how the album is reached from a chat that holds no
+    // pictures.
+    if let Some(path) = viewer_file(message)
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Maximize),
+            &crate::i18n::gettext(view.locale, "Open in the viewer"),
+        )
+    {
+        actions.push(Action::PreviewImage {
+            path: path.to_owned(),
+            chat: chat.clone(),
+            message: message.id.clone(),
+            card: None,
+        });
+    }
     if crate::app::can_select(&message.content)
         && widgets::menu_item(ui, &palette, Some(Icon::Check), "Select")
     {
+        if matches!(origin, MenuOrigin::List) {
+            actions.push(Action::OpenMessage {
+                chat: chat.clone(),
+                message: message.id.clone(),
+            });
+        }
         actions.push(Action::SelectMessage(message.id.clone()));
     }
     let text = match &message.content {
@@ -4237,6 +5919,12 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         && !matches!(message.content, Content::Revoked)
         && age <= crate::app::REVOKE_WINDOW.as_secs() as i64;
     if can_edit && widgets::menu_item(ui, &palette, Some(Icon::Pencil), "Edit") {
+        if matches!(origin, MenuOrigin::List) {
+            actions.push(Action::OpenMessage {
+                chat: chat.clone(),
+                message: message.id.clone(),
+            });
+        }
         actions.push(Action::Edit(message.id.clone()));
     }
     if can_revoke && widgets::menu_item(ui, &palette, Some(Icon::Trash), "Delete for everyone") {
@@ -4311,6 +5999,7 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
                     !downloading,
                 ) {
                     actions.push(Action::Download {
+                        manual: true,
                         card: None,
                         chat: chat.clone(),
                         message: message.id.clone(),
@@ -4327,12 +6016,7 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
     widgets::menu_separator(ui, &palette);
     // The menu holds actions only. Sent, delivery, and read times, per member
     // in a group, live in "Message info".
-    if message.from_me
-        && !matches!(message.content, Content::Revoked)
-        && !matches!(
-            message.status,
-            Delivery::None | Delivery::Pending | Delivery::Failed
-        )
+    if has_message_info(message)
         && widgets::menu_item(
             ui,
             &palette,
@@ -4560,8 +6244,8 @@ fn content(
         | Content::Document { caption, .. } => caption.is_some(),
         _ => false,
     };
-    if !has_body {
-        view.copy_rows
+    if !has_body && let Some(copy_rows) = view.copy_rows {
+        copy_rows
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(transcript_row(view, message, String::new(), Vec::new()));
@@ -4606,8 +6290,15 @@ fn content(
             let span = (message.quoted.is_some() || preview.is_some()).then_some(width);
             rich_body(ui, view, message, text, width, Some(reserve), span, actions)
         }
-        Content::Image { caption, media } => {
+        Content::Image {
+            caption,
+            media,
+            motion,
+        } => {
             let drawn = picture(ui, view, message, media, width, None, actions);
+            if let Some(motion) = motion {
+                motion_clip(ui, view, message, motion, drawn, actions);
+            }
             ui.ctx().data_mut(|data| {
                 data.insert_temp(bubble_id(&view.chat.id, &message.id).with("picture"), drawn);
             });
@@ -4674,7 +6365,9 @@ fn content(
             seconds,
             waveform,
             ..
-        } => voice_player(ui, view, message, media, *seconds, waveform, width, actions),
+        } => voice_player(
+            ui, view, message, media, *seconds, waveform, width, reserve, actions,
+        ),
         Content::Document {
             media,
             file_name,
@@ -4722,13 +6415,25 @@ fn content(
             let title = name
                 .clone()
                 .unwrap_or_else(|| crate::i18n::gettext(view.locale, "Location").into_owned());
+            // A spot sent from here names no place, so the coordinates take the
+            // line an address would.
+            let detail = address.clone().or_else(|| {
+                Some(
+                    Spot {
+                        latitude: *latitude,
+                        longitude: *longitude,
+                    }
+                    .text(),
+                )
+            });
             location_card(
                 ui,
                 view,
                 message,
                 &message.id,
                 &title,
-                address.clone(),
+                detail,
+                None,
                 (*latitude, *longitude),
                 actions,
             );
@@ -4741,11 +6446,18 @@ fn content(
             speed_mps,
             sequence,
             updated,
+            newer_on_phone,
             ..
         } => {
             let over = message
                 .content
                 .live_location_over(message.timestamp, view.now);
+            if !over {
+                let until_expiry =
+                    (message.timestamp + crate::model::LIVE_LOCATION_LIMIT - view.now).max(1);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs(until_expiry as u64));
+            }
             let title = if over {
                 crate::i18n::gettext(view.locale, "Live location ended")
             } else {
@@ -4770,6 +6482,13 @@ fn content(
                 }
                 meta.join(" · ")
             });
+            // The phone holds the positions that follow this one: WhatsApp
+            // keeps live locations off linked devices, so say where the rest
+            // of the share is instead of letting the pin look live.
+            let note = (!over && *newer_on_phone).then(|| {
+                crate::i18n::gettext(view.locale, "Open WhatsApp on your phone to follow it.")
+                    .into_owned()
+            });
             // Each position gets its own preview, as a later one replaces the first.
             let key = format!("{}-{sequence}-{updated}", message.id);
             location_card(
@@ -4779,6 +6498,7 @@ fn content(
                 &key,
                 &title,
                 detail,
+                note,
                 (*latitude, *longitude),
                 actions,
             );
@@ -4818,6 +6538,7 @@ fn content(
                                     actions.push(Action::StartChat {
                                         id: id.clone(),
                                         name: name.to_owned(),
+                                        dismiss_dialog: true,
                                     });
                                 }
                                 if !view.contacts.contains_key(&id)
@@ -4907,6 +6628,62 @@ fn content(
                 view.poll_voting
                     .contains(&(message.chat.clone(), message.id.clone())),
                 actions,
+            );
+            None
+        }
+        Content::Call {
+            video,
+            status,
+            duration,
+            group,
+        } => {
+            let entry = super::calls::Entry {
+                from_me: own,
+                video: *video,
+                status: *status,
+                duration: *duration,
+                group: *group,
+            };
+            let tint = if status.is_bad() {
+                palette.danger
+            } else {
+                palette.accent
+            };
+            mirrored_row(
+                ui,
+                own,
+                |ui| {
+                    theme::icon(ui, entry.icon(), 20.0, tint);
+                },
+                |ui| {
+                    // Measured first and laid out at that width: a plain
+                    // `vertical` in an own bubble's right-to-left row takes
+                    // every point the row offers, which stretched a call's
+                    // bubble across the transcript.
+                    let title = entry.title(view.locale);
+                    let detail = entry.detail(view.locale);
+                    let measure = |text: &str, font: egui::FontId| {
+                        ui.painter()
+                            .layout_no_wrap(text.to_owned(), font, palette.text)
+                            .size()
+                            .x
+                    };
+                    let width = detail
+                        .as_deref()
+                        .map(|detail| measure(detail, theme::regular(12.5)))
+                        .unwrap_or(0.0)
+                        .max(measure(&title, theme::medium(14.0)));
+                    ui.allocate_ui_with_layout(
+                        vec2(width, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            theme::text(ui, title, theme::medium(14.0), palette.text);
+                            if let Some(detail) = detail {
+                                theme::text(ui, detail, theme::regular(12.5), palette.secondary);
+                            }
+                        },
+                    );
+                },
             );
             None
         }
@@ -5249,6 +7026,275 @@ fn carousel_arrow(
         .on_hover_text(label)
 }
 
+/// Draws WhatsApp's media-album items as one compact grid with one batch
+/// action, and returns where each member's tile was drawn.
+fn album_content(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    messages: &[Message],
+    width: f32,
+    actions: &mut Vec<Action>,
+) -> Vec<(Rect, String)> {
+    let gap = 3.0;
+    let columns = 2;
+    let tile = ((width - gap * (columns - 1) as f32) / columns as f32).max(80.0);
+    let mut tiles = Vec::with_capacity(messages.len());
+    for (row, chunk) in messages.chunks(columns).enumerate() {
+        // An own bubble lays out right to left; the grid keeps reading order.
+        ui.allocate_ui_with_layout(
+            vec2(tile * columns as f32 + gap, tile),
+            Layout::left_to_right(Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (column, message) in chunk.iter().enumerate() {
+                    if let Some(rect) =
+                        album_tile(ui, view, message, vec2(tile, tile), row, column, actions)
+                    {
+                        tiles.push((rect, message.id.clone()));
+                    }
+                }
+            },
+        );
+    }
+
+    for message in messages {
+        let caption = match &message.content {
+            Content::Image { caption, .. } | Content::Video { caption, .. } => caption.as_deref(),
+            _ => None,
+        };
+        if let Some(caption) = caption.filter(|caption| !caption.is_empty()) {
+            let _ = rich_body(
+                ui,
+                view,
+                message,
+                caption,
+                width,
+                None,
+                Some(width),
+                actions,
+            );
+        } else if let Some(copy_rows) = view.copy_rows {
+            copy_rows
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(transcript_row(view, message, String::new(), Vec::new()));
+        }
+    }
+
+    let missing: Vec<&Message> = messages
+        .iter()
+        .filter(|message| {
+            message
+                .content
+                .media()
+                .is_some_and(|media| media.path.is_none())
+        })
+        .collect();
+    let files: Vec<(PathBuf, String)> = messages
+        .iter()
+        .filter_map(|message| {
+            let path = message.content.media()?.path.as_ref()?;
+            Some((path.clone(), attachment_name(&message.content, path)))
+        })
+        .collect();
+    if !files.is_empty()
+        && theme::pill_button(
+            ui,
+            &view.palette,
+            &crate::i18n::gettext(view.locale, "Save all…"),
+            true,
+        )
+        .clicked()
+    {
+        actions.push(Action::SaveAttachments { files });
+    }
+    if !missing.is_empty() {
+        let downloading = missing.iter().all(|message| {
+            message
+                .content
+                .media()
+                .is_some_and(|media| matches!(media.state, MediaState::Downloading))
+        });
+        if theme::pill_button(
+            ui,
+            &view.palette,
+            &crate::i18n::gettext(
+                view.locale,
+                if downloading {
+                    "Downloading…"
+                } else {
+                    "Download all"
+                },
+            ),
+            !downloading,
+        )
+        .clicked()
+        {
+            for message in missing {
+                if let Some(media) = message.content.media()
+                    && !matches!(media.state, MediaState::Downloading)
+                {
+                    actions.push(Action::Download {
+                        manual: true,
+                        card: None,
+                        chat: message.chat.clone(),
+                        message: message.id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    tiles
+}
+
+/// Draws one album member with its own download, selection and activation
+/// targets, and returns its rect.
+fn album_tile(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    size: Vec2,
+    row: usize,
+    column: usize,
+    actions: &mut Vec<Action>,
+) -> Option<Rect> {
+    let media = message.content.media()?;
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let kind = if matches!(message.content, Content::Image { .. }) {
+        "Photo"
+    } else {
+        "Video"
+    };
+    let state = match (&media.path, &media.state) {
+        (Some(_), _) => "Open".to_owned(),
+        (None, MediaState::Downloading) => "Downloading".to_owned(),
+        (None, MediaState::Failed(error)) => format!("Failed: {error}"),
+        (None, MediaState::Idle) => "Download".to_owned(),
+    };
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{kind}, {state}"))
+    });
+    theme::reveal_focus(&response);
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 5.0, view.palette.surface);
+        let uri = media
+            .path
+            .as_ref()
+            .filter(|_| matches!(message.content, Content::Image { .. }))
+            .map(|path| {
+                let uri = crate::util::image_uri(path);
+                crate::image_cache::touch(ui.ctx(), &uri);
+                uri
+            })
+            .or_else(|| {
+                message.thumbnail.as_deref().map(|bytes| {
+                    thumbnail_uri(
+                        ui.ctx(),
+                        &message.chat,
+                        &format!("{}-album-{row}-{column}", message.id),
+                        bytes,
+                    )
+                })
+            });
+        if let Some(uri) = uri {
+            let image = egui::Image::new(uri);
+            let dimensions = match image.load_for_size(ui.ctx(), size) {
+                Ok(egui::load::TexturePoll::Ready { texture }) => Some(texture.size),
+                Ok(egui::load::TexturePoll::Pending { .. }) => Some(vec2(
+                    media.width.unwrap_or(1) as f32,
+                    media.height.unwrap_or(1) as f32,
+                )),
+                Err(_) => None,
+            };
+            if let Some(dimensions) = dimensions {
+                let ratio = dimensions.x / dimensions.y.max(1.0);
+                let target = size.x / size.y.max(1.0);
+                let uv = if ratio > target {
+                    vec2(target / ratio, 1.0)
+                } else {
+                    vec2(1.0, ratio / target)
+                };
+                image
+                    .uv(Rect::from_center_size(pos2(0.5, 0.5), uv))
+                    .fit_to_exact_size(size)
+                    .corner_radius(5.0)
+                    .paint_at(ui, rect);
+            }
+        }
+        if matches!(message.content, Content::Video { .. }) {
+            theme::paint_icon(ui, Icon::Play, rect, 30.0, Color32::WHITE);
+        }
+        if media.path.is_none() {
+            let disc = Rect::from_center_size(rect.center(), Vec2::splat(42.0));
+            ui.painter()
+                .circle_filled(disc.center(), 21.0, Color32::from_black_alpha(130));
+            match media.state {
+                MediaState::Downloading => theme::paint_spinner(ui, disc, 20.0, Color32::WHITE),
+                MediaState::Failed(_) => {
+                    theme::paint_icon(ui, Icon::CircleAlert, disc, 20.0, Color32::WHITE)
+                }
+                MediaState::Idle => {
+                    theme::paint_icon(ui, Icon::Download, disc, 20.0, Color32::WHITE)
+                }
+            }
+        }
+        if not_sent(message) {
+            let starred = view.starred.is_some_and(|ids| ids.contains(&message.id));
+            let pinned = view.pins.is_some_and(|ids| ids.contains(&message.id));
+            footer_over_picture(ui, view, message, rect, starred, pinned, actions);
+        }
+    }
+    // A motion photo in an album keeps its own badge and clip.
+    if let Content::Image {
+        motion: Some(motion),
+        ..
+    } = &message.content
+    {
+        motion_clip(ui, view, message, motion, rect, actions);
+    }
+    theme::focus_outline(ui, response.id, rect, 5.0);
+    // Each member keeps its own failure: the others stay usable, and a click
+    // on this one retries it.
+    let response = if let MediaState::Failed(error) = &media.state {
+        response.on_hover_text(format!("{error} · Click to retry"))
+    } else {
+        response
+    };
+    if response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        if let Some(path) = &media.path {
+            // A photo or a clip the viewer plays opens there, over the
+            // chat's album; anything else goes to the system's own viewer.
+            actions.push(match crate::image_preview::open_target(path, true) {
+                crate::image_preview::OpenTarget::Preview => Action::PreviewImage {
+                    path: path.clone(),
+                    chat: message.chat.clone(),
+                    message: message.id.clone(),
+                    card: None,
+                },
+                crate::image_preview::OpenTarget::External => Action::OpenFile(path.clone()),
+            });
+        } else if !matches!(media.state, MediaState::Downloading) {
+            actions.push(Action::Download {
+                manual: true,
+                card: None,
+                chat: message.chat.clone(),
+                message: message.id.clone(),
+            });
+        }
+    }
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(album_tile_id(&view.chat.id, &message.id), rect));
+    Some(rect)
+}
+
+/// Where an album member's tile was drawn, for interaction tests.
+pub fn album_tile_id(chat: &str, message: &str) -> egui::Id {
+    bubble_id(chat, message).with("album-tile")
+}
+
 /// A carousel uses a short image preview; opening it shows the full picture.
 fn carousel_picture(
     ui: &mut egui::Ui,
@@ -5363,7 +7409,17 @@ fn carousel_picture(
     }
     if let Some(path) = &media.path {
         if clicked {
-            actions.push(Action::OpenFile(path.clone()));
+            // A card's picture opens in the viewer, among the chat's album,
+            // as any other photo does.
+            actions.push(match crate::image_preview::open_target(path, true) {
+                crate::image_preview::OpenTarget::Preview => Action::PreviewImage {
+                    path: path.clone(),
+                    chat: message.chat.clone(),
+                    message: message.id.clone(),
+                    card: Some(index),
+                },
+                crate::image_preview::OpenTarget::External => Action::OpenFile(path.clone()),
+            });
         }
     } else if !matches!(media.state, MediaState::Downloading)
         && (clicked
@@ -5372,6 +7428,7 @@ fn carousel_picture(
                 && matches!(media.state, MediaState::Idle)))
     {
         actions.push(Action::Download {
+            manual: clicked,
             chat: message.chat.clone(),
             message: message.id.clone(),
             card: Some(index),
@@ -5634,31 +7691,105 @@ fn rich_body(
         allocation.x = allocation.x.max(span);
     }
     // Register the body for transcript formatting when copying across messages.
-    view.copy_rows
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(transcript_row(
-            view,
-            message,
-            laid.galley.text().to_owned(),
-            laid.placements().to_vec(),
-        ));
+    if let Some(copy_rows) = view.copy_rows {
+        copy_rows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(transcript_row(
+                view,
+                message,
+                laid.galley.text().to_owned(),
+                laid.placements().to_vec(),
+            ));
+    }
     // Click links and drag to select text.
-    // Text selection and pointer links do not need a sequential Tab stop.
+    // Text selection and web links do not need a sequential Tab stop.
     // The surrounding transcript remains available to accessibility readers.
     let (_, rect) = ui.allocate_space(allocation);
     // egui matches selection endpoints to widgets by id every frame and drops
     // the selection when one is missed. A positional auto id shifts whenever
     // a sibling allocates differently (virtualized rows), killing the
     // selection mid-drag; an explicit id keeps the anchor alive.
+    let id = bubble_id(&view.chat.id, &message.id);
+    // Starting a browser-style sweep on a plain text message should work from
+    // anywhere in its bubble, including the footer and generous side padding.
+    // Captioned media keeps the narrower expansion so this response cannot
+    // cover the picture or another control inside the same bubble.
+    let selection_rect = ui
+        .ctx()
+        .data(|data| data.get_temp::<Rect>(id.with("rect")))
+        .map(|bubble| {
+            // Virtualized rows can move between frames. Align the cached bubble
+            // to this frame's body before expanding its input target, so it
+            // cannot cover a neighboring message after a layout change.
+            let bubble = ui
+                .ctx()
+                .data(|data| data.get_temp::<Rect>(id.with("body")))
+                .map(|previous| {
+                    let mut bubble = bubble.translate(rect.min - previous.min);
+                    bubble.max += rect.size() - previous.size();
+                    bubble
+                })
+                .unwrap_or(bubble);
+            if matches!(message.content, Content::Text { .. }) {
+                let mut target = bubble.union(rect);
+                // Quote and preview cards have their own click actions and
+                // were registered before the text. Keep their current-frame
+                // rectangles outside this later, enlarged input target.
+                for kind in ["quote", "preview"] {
+                    let present = if kind == "quote" {
+                        message.quoted.is_some()
+                    } else {
+                        matches!(
+                            message.content,
+                            Content::Text {
+                                preview: Some(_),
+                                ..
+                            }
+                        )
+                    };
+                    if !present {
+                        continue;
+                    }
+                    if let Some(card) = ui.ctx().data(|data| data.get_temp::<Rect>(id.with(kind))) {
+                        target.min.y = target.min.y.max(card.bottom());
+                    }
+                }
+                target
+            } else {
+                rect.expand2(vec2(10.0, 6.0)).intersect(bubble).union(rect)
+            }
+        })
+        .unwrap_or(rect);
     let response = ui.interact(
-        rect,
-        bubble_id(&view.chat.id, &message.id).with("body-text"),
+        selection_rect,
+        id.with("body-text"),
         Sense::CLICK | Sense::DRAG,
     );
+    // The expanded target owns pointer input in the padding. Preserve the
+    // bubble gestures that lived there before, while double-clicks on actual
+    // text still select a word.
+    let padding = response
+        .interact_pointer_pos()
+        .is_some_and(|pointer| !rect.contains(pointer));
+    if padding {
+        reply_on_double_click(&response, message, actions);
+        if response.clicked() && !response.double_clicked() {
+            let modifiers = ui.input(|input| input.modifiers);
+            if view.selecting {
+                actions.push(if modifiers.shift {
+                    Action::SelectRange(message.id.clone())
+                } else {
+                    Action::ToggleSelected(message.id.clone())
+                });
+            } else if modifiers.command {
+                actions.push(Action::SelectMessage(message.id.clone()));
+            }
+        }
+    }
     // Store the body rect for selection tests.
     ui.ctx().data_mut(|data| {
-        data.insert_temp(bubble_id(&view.chat.id, &message.id).with("body"), rect);
+        data.insert_temp(id.with("body"), rect);
     });
     // Keep off-screen selected bodies registered so scrolling does not lose
     // the selection anchor or omit copied text.
@@ -5676,13 +7807,93 @@ fn rich_body(
     if visible || selection_alive {
         markup::paint_selectable(ui, &laid, &response, origin, palette.text, visible);
     }
+    let message_number = crate::i18n::gettext(view.locale, "Message");
+    let copy_number = crate::i18n::gettext(view.locale, "Copy number");
+    let menu_labels = [message_number.as_ref(), copy_number.as_ref()];
+    for (range, url) in &laid.links {
+        let Some(phone) = url.strip_prefix("tel:") else {
+            continue;
+        };
+        let number = phone.strip_prefix('+').unwrap_or(phone);
+        let copy_text: String = laid
+            .galley
+            .text()
+            .chars()
+            .skip(range.start)
+            .take(range.len())
+            .collect();
+        for (row, bounds) in crate::bidi::char_bounds_by_row(&laid.galley, range.start, range.end) {
+            let link = ui
+                .interact(
+                    bounds.translate(origin.to_vec2()).expand(2.0),
+                    bubble_id(&view.chat.id, &message.id).with((
+                        "phone-link",
+                        range.start,
+                        range.end,
+                        row,
+                    )),
+                    Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            link.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), number)
+            });
+            theme::reveal_focus(&link);
+            let link = focus::phone_link(link);
+            egui::Popup::menu(&link)
+                .id(link.id.with("popup"))
+                .width(widgets::menu_width(ui, &menu_labels, true))
+                .frame(widgets::menu_frame(&view.palette))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                .show(|ui| {
+                    #[cfg(test)]
+                    let message_rect =
+                        Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 28.0));
+                    let message_clicked =
+                        widgets::menu_item(ui, &view.palette, None, message_number.as_ref());
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(link.id.with("test-message-action"), message_rect);
+                    });
+                    if message_clicked {
+                        actions.push(Action::NewContact {
+                            phone: number.to_owned(),
+                            first: String::new(),
+                            last: String::new(),
+                            to_phone: None,
+                        });
+                    }
+                    #[cfg(test)]
+                    let copy_rect =
+                        Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 28.0));
+                    let copy_clicked = widgets::menu_item(
+                        ui,
+                        &view.palette,
+                        Some(Icon::Copy),
+                        copy_number.as_ref(),
+                    );
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(link.id.with("test-copy-action"), copy_rect);
+                    });
+                    if copy_clicked {
+                        actions.push(Action::CopyText(copy_text.clone()));
+                    }
+                });
+        }
+    }
     if !laid.links.is_empty()
         && let Some(pos) = response.hover_pos()
+        && laid
+            .galley
+            .rows
+            .iter()
+            .any(|row| Rect::from_min_size(origin + row.pos.to_vec2(), row.row.size).contains(pos))
     {
         let cursor = laid.galley.cursor_from_pos(pos - origin);
         if let Some(url) = laid.link_at(cursor.index.0) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            if response.clicked() {
+            if !url.starts_with("tel:") && response.clicked() {
                 actions.push(Action::OpenUrl(url.to_owned()));
             }
         }
@@ -5793,6 +8004,7 @@ fn location_card(
     preview_key: &str,
     title: &str,
     detail: Option<String>,
+    note: Option<String>,
     (latitude, longitude): (f64, f64),
     actions: &mut Vec<Action>,
 ) {
@@ -5827,6 +8039,9 @@ fn location_card(
         if let Some(detail) = detail {
             widgets::rich_text(ui, &detail, theme::regular(12.5), palette.secondary);
         }
+        if let Some(note) = note {
+            widgets::rich_text(ui, &note, theme::regular(12.5), palette.secondary);
+        }
         if theme::link(
             ui,
             crate::i18n::gettext(view.locale, "Open in a map").as_ref(),
@@ -5835,14 +8050,16 @@ fn location_card(
         )
         .clicked()
         {
-            actions.push(Action::OpenUrl(format!(
-                "https://www.openstreetmap.org/?mlat={latitude}&mlon={longitude}#map=16/{latitude}/{longitude}"
-            )));
+            let spot = Spot {
+                latitude,
+                longitude,
+            };
+            actions.push(Action::OpenUrl(crate::geo::map_url(spot)));
         }
     });
 }
 
-fn thumbnail_uri(ctx: &egui::Context, chat: &str, id: &str, bytes: &[u8]) -> String {
+pub(crate) fn thumbnail_uri(ctx: &egui::Context, chat: &str, id: &str, bytes: &[u8]) -> String {
     let uri = format!(
         "bytes://thumb-{}-{}",
         chat.chars()
@@ -5850,7 +8067,7 @@ fn thumbnail_uri(ctx: &egui::Context, chat: &str, id: &str, bytes: &[u8]) -> Str
             .collect::<String>(),
         id
     );
-    crate::image_cache::include(ctx, uri.clone(), bytes);
+    crate::image_cache::include(ctx, &uri, bytes);
     uri
 }
 
@@ -5922,11 +8139,15 @@ fn picture(
     actions: &mut Vec<Action>,
 ) -> Rect {
     let palette = view.palette;
+    let radius = picture_radius(&palette, message);
     let (max_width, max_height) = match sticker {
         Some(_) => (STICKER_SIDE, STICKER_SIDE),
         None => (width.min(PICTURE_WIDTH), PICTURE_HEIGHT),
     };
     if let Some(path) = &media.path {
+        // Phones often leave a sticker's animated flag out, so a downloaded
+        // file that says it moves is played as well.
+        let sticker = sticker.map(|animated| animated || crate::ui::picker::moves(ui.ctx(), path));
         if sticker == Some(true) {
             let size = fit_sticker(
                 media.width.unwrap_or(180) as f32,
@@ -5944,7 +8165,7 @@ fn picture(
                         );
                     }
                     _ => {
-                        ui.painter().rect_filled(rect, 6.0, palette.surface);
+                        ui.painter().rect_filled(rect, radius, palette.surface);
                         theme::paint_icon(ui, Icon::Sticker, rect, 32.0, palette.secondary);
                     }
                 }
@@ -5953,7 +8174,7 @@ fn picture(
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
-                actions.push(Action::OpenFile(path.clone()));
+                actions.push(Action::PreviewSticker(path.clone()));
             }
             return rect;
         }
@@ -5990,7 +8211,7 @@ fn picture(
                 let response = ui.add(
                     image
                         .fit_to_exact_size(size)
-                        .corner_radius(if sticker.is_some() { 0.0 } else { 6.0 })
+                        .corner_radius(if sticker.is_some() { 0.0 } else { radius })
                         .sense(Sense::click()),
                 );
                 let rect = response.rect;
@@ -5998,13 +8219,19 @@ fn picture(
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
-                    let action = match crate::image_preview::open_target(path, sticker.is_none()) {
-                        crate::image_preview::OpenTarget::Preview => {
-                            Action::PreviewImage(path.clone())
-                        }
-                        crate::image_preview::OpenTarget::External => {
-                            Action::OpenFile(path.clone())
-                        }
+                    let action = match sticker {
+                        Some(_) => Action::PreviewSticker(path.clone()),
+                        None => match crate::image_preview::open_target(path, true) {
+                            crate::image_preview::OpenTarget::Preview => Action::PreviewImage {
+                                path: path.clone(),
+                                chat: view.chat.id.clone(),
+                                message: message.id.clone(),
+                                card: None,
+                            },
+                            crate::image_preview::OpenTarget::External => {
+                                Action::OpenFile(path.clone())
+                            }
+                        },
                     };
                     actions.push(action);
                 }
@@ -6019,7 +8246,7 @@ fn picture(
                 };
                 let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                 if ui.is_rect_visible(rect) {
-                    ui.painter().rect_filled(rect, 6.0, palette.surface);
+                    ui.painter().rect_filled(rect, radius, palette.surface);
                     theme::paint_spinner(ui, rect, 22.0, palette.accent);
                 }
                 rect
@@ -6032,7 +8259,7 @@ fn picture(
                 };
                 let (rect, response) = ui.allocate_exact_size(size, Sense::click());
                 if ui.is_rect_visible(rect) {
-                    ui.painter().rect_filled(rect, 6.0, palette.surface);
+                    ui.painter().rect_filled(rect, radius, palette.surface);
                     theme::paint_icon(ui, Icon::CircleAlert, rect, 24.0, palette.danger);
                     ui.painter().text(
                         rect.center() + vec2(0.0, 24.0),
@@ -6061,13 +8288,13 @@ fn picture(
             Some(uri) => {
                 egui::Image::new(uri)
                     .fit_to_exact_size(size)
-                    .corner_radius(6.0)
+                    .corner_radius(radius)
                     .paint_at(ui, rect);
                 ui.painter()
-                    .rect_filled(rect, 6.0, Color32::from_black_alpha(60));
+                    .rect_filled(rect, radius, Color32::from_black_alpha(60));
             }
             None => {
-                ui.painter().rect_filled(rect, 6.0, palette.surface);
+                ui.painter().rect_filled(rect, radius, palette.surface);
             }
         }
         let disc = Rect::from_center_size(rect.center(), Vec2::splat(44.0));
@@ -6124,12 +8351,81 @@ fn picture(
         && auto_download_allowed(media, sticker.is_some(), view.auto_download);
     if wants || auto {
         actions.push(Action::Download {
+            manual: wants,
             card: None,
             chat: view.chat.id.clone(),
             message: message.id.clone(),
         });
     }
     rect
+}
+
+/// Draws a motion photo's badge in the corner of its picture, and its clip
+/// over the picture while it plays, muted and looping.
+fn motion_clip(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    motion: &crate::model::Motion,
+    picture: Rect,
+    actions: &mut Vec<Action>,
+) {
+    if !ui.is_rect_visible(picture) {
+        return;
+    }
+    let playing = view.motion_playing == Some(message.id.as_str());
+    let toggle = || Action::ToggleMotion {
+        chat: view.chat.id.clone(),
+        message: message.id.clone(),
+    };
+    let badge = Rect::from_min_size(picture.min + vec2(6.0, 6.0), Vec2::splat(28.0));
+    let response = ui
+        .interact(
+            badge,
+            bubble_id(&view.chat.id, &message.id).with("motion"),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        actions.push(toggle());
+    }
+    let frame = motion
+        .path
+        .as_ref()
+        .filter(|_| playing)
+        .map(|path| (path, animation::frame(ui, path, picture, view.animate)));
+    let icon = match (&frame, &motion.state) {
+        (Some((_, animation::Frame::Ready(texture))), _) => {
+            ui.painter().rect_filled(picture, 6.0, Color32::BLACK);
+            paint_texture(
+                ui,
+                fit_within(texture.size_vec2(), picture),
+                texture.id(),
+                Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                6.0,
+            );
+            Some(Icon::Pause)
+        }
+        (Some((path, animation::Frame::Unavailable)), _) => {
+            // No decoder here plays it: the system player gets the clip.
+            actions.push(toggle());
+            actions.push(Action::OpenFile((*path).clone()));
+            Some(Icon::Play)
+        }
+        (Some((_, animation::Frame::Pending)), _) => None,
+        (None, MediaState::Downloading) if playing => None,
+        (None, MediaState::Failed(_)) => Some(Icon::CircleAlert),
+        (None, _) => Some(Icon::Play),
+    };
+    ui.painter()
+        .circle_filled(badge.center(), 14.0, Color32::from_black_alpha(140));
+    match icon {
+        Some(icon) => theme::paint_icon(ui, icon, badge, 14.0, Color32::WHITE),
+        None => theme::paint_spinner(ui, badge, 16.0, Color32::WHITE),
+    }
+    if let MediaState::Failed(error) = &motion.state {
+        response.on_hover_text(error);
+    }
 }
 
 /// Stickers always download when visible, while other media follows the setting.
@@ -6349,6 +8645,7 @@ fn video(
         && media.is_within_download_limit();
     if auto {
         actions.push(Action::Download {
+            manual: false,
             card: None,
             chat: view.chat.id.clone(),
             message: message.id.clone(),
@@ -6374,8 +8671,10 @@ fn video(
 
 /// What a click on a video does: a downloaded video plays or pauses, a GIF
 /// that cannot play here opens in the system viewer, and a video still on
-/// WhatsApp's servers downloads and then plays. `downloading` is set when
-/// this frame already asked for the download.
+/// WhatsApp's servers downloads and then plays. The full-window viewer is a
+/// separate way in, from the message's own menu, so a clip keeps playing in
+/// its bubble here. `downloading` is set when this frame already asked for the
+/// download.
 fn video_clicked(
     view: &View<'_>,
     message: &Message,
@@ -6393,6 +8692,7 @@ fn video_clicked(
         None => {
             if !downloading && !matches!(media.state, MediaState::Downloading) {
                 actions.push(Action::Download {
+                    manual: true,
                     card: None,
                     chat: view.chat.id.clone(),
                     message: message.id.clone(),
@@ -6488,7 +8788,7 @@ pub(crate) fn video_controls(
         .clicked()
     {
         actions.push(if controls.expanded {
-            Action::CollapseVideo
+            Action::CloseImagePreview
         } else {
             Action::ExpandVideo {
                 message: message.to_owned(),
@@ -6521,6 +8821,34 @@ pub(crate) fn video_controls(
     {
         actions.push(Action::ToggleVideoSound);
     }
+    // The playback speed, cycled by a click as the voice message chip is.
+    let speed_label = crate::audio::speed_label(controls.player.speed());
+    let speed_galley = ui.painter().layout_no_wrap(
+        speed_label,
+        theme::tabular(fastframe_fonts::Weight::Medium, 11.5),
+        Color32::WHITE,
+    );
+    let speed = Rect::from_center_size(
+        pos2(
+            sound.left() - 4.0 - (speed_galley.size().x + 10.0) / 2.0,
+            bar.center().y,
+        ),
+        vec2(speed_galley.size().x + 10.0, 18.0),
+    );
+    ui.painter()
+        .rect_filled(speed, 9.0, Color32::from_white_alpha(40));
+    ui.painter().galley(
+        speed.center() - speed_galley.size() / 2.0,
+        speed_galley,
+        Color32::WHITE,
+    );
+    if ui
+        .interact(speed, id.with("speed"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        actions.push(Action::CycleVideoSpeed);
+    }
     let time = format!(
         "{} / {}",
         crate::util::duration(status.position.as_secs() as u32),
@@ -6534,7 +8862,7 @@ pub(crate) fn video_controls(
     let text = pos2(toggle.right() + 4.0, bar.center().y - galley.size().y / 2.0);
     let track = Rect::from_min_max(
         pos2(text.x + galley.size().x + 10.0, bar.center().y - 8.0),
-        pos2(sound.left() - 6.0, bar.center().y + 8.0),
+        pos2(speed.left() - 6.0, bar.center().y + 8.0),
     );
     ui.painter().galley(text, galley, Color32::WHITE);
     if track.width() < 12.0 {
@@ -6700,6 +9028,7 @@ fn video_note(
         && media.is_within_download_limit();
     if auto {
         actions.push(Action::Download {
+            manual: false,
             card: None,
             chat: view.chat.id.clone(),
             message: message.id.clone(),
@@ -6810,6 +9139,7 @@ fn attachment(
         && media.is_within_download_limit();
     if auto {
         actions.push(Action::Download {
+            manual: false,
             card: None,
             chat: view.chat.id.clone(),
             message: message.id.clone(),
@@ -6833,6 +9163,7 @@ fn attachment(
             Some(path) => actions.push(Action::OpenFile(path.clone())),
             None if !matches!(media.state, MediaState::Downloading) => {
                 actions.push(Action::Download {
+                    manual: true,
                     card: None,
                     chat: view.chat.id.clone(),
                     message: message.id.clone(),
@@ -6843,7 +9174,15 @@ fn attachment(
     }
 }
 
-/// In-chat voice and audio player.
+/// The space above a conversation's messages that keeps a short one at the
+/// bottom of the view: what `natural`, the height the messages took last
+/// frame, leaves of the viewport. Unmeasured, there is none.
+fn bottom_filler(viewport: f32, natural: Option<f32>, spacing: f32) -> f32 {
+    natural.map_or(0.0, |natural| (viewport - natural - spacing).max(0.0))
+}
+
+/// Draws the in-chat player with a waveform for voice notes or a track and music badge
+/// for audio files. Playback, seeking and speed controls remain shared between both types.
 #[allow(clippy::too_many_arguments)]
 fn voice_player(
     ui: &mut egui::Ui,
@@ -6853,6 +9192,7 @@ fn voice_player(
     seconds: Option<u32>,
     waveform: &[u8],
     width: f32,
+    reserve: f32,
     actions: &mut Vec<Action>,
 ) -> Option<Rect> {
     use crate::audio::State;
@@ -6863,10 +9203,22 @@ fn voice_player(
     let button = 36.0;
     let bar_height = 30.0;
     let chip = 44.0;
+    let voice_note = matches!(
+        message.content,
+        Content::Audio {
+            voice_note: true,
+            ..
+        }
+    );
     // The chip appears with the playable clip; the waveform takes its space
     // back while the audio is still downloading.
     let shows_chip = media.path.is_some();
-    let wave_width = (width - button - 10.0 - if shows_chip { chip + 10.0 } else { 0.0 }).max(0.0);
+    let wave_width = (width
+        - button
+        - 10.0
+        - if shows_chip { chip + 10.0 } else { 0.0 }
+        - if voice_note { 0.0 } else { button + 10.0 })
+    .max(0.0);
     let bars: Vec<u8> = if !waveform.is_empty() {
         waveform.to_vec()
     } else if let Some(bars) = view.player.bars(&message.id) {
@@ -6887,7 +9239,8 @@ fn voice_player(
         });
     };
     // Force left-to-right layout at the player's width inside own bubbles.
-    ui.allocate_ui_with_layout(
+    let mut duration = None;
+    let row = ui.allocate_ui_with_layout(
         vec2(width.max(0.0), button),
         Layout::left_to_right(Align::Center),
         |ui| {
@@ -6910,6 +9263,7 @@ fn voice_player(
                     .clicked()
                     {
                         actions.push(Action::Download {
+                            manual: true,
                             card: None,
                             chat: view.chat.id.clone(),
                             message: message.id.clone(),
@@ -7015,7 +9369,25 @@ fn voice_player(
                 };
                 let played_until = rect.left() + fraction * rect.width();
                 let quiet = palette.secondary.gamma_multiply(0.7);
-                if count > 0 {
+                let kind = if voice_note {
+                    "voice-waveform"
+                } else {
+                    "audio-track"
+                };
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(bubble_id(&view.chat.id, &message.id).with(kind), rect);
+                });
+                if !voice_note {
+                    let track = Rect::from_center_size(rect.center(), vec2(rect.width(), 4.0));
+                    ui.painter().rect_filled(track, 2.0, quiet);
+                    if fraction > 0.0 {
+                        ui.painter().rect_filled(
+                            Rect::from_min_max(track.min, pos2(played_until, track.bottom())),
+                            2.0,
+                            palette.accent,
+                        );
+                    }
+                } else if count > 0 {
                     for index in 0..count {
                         let level = f32::from(bars[index * bars.len() / count]) / 100.0;
                         let height = (2.0 + level * (bar_height - 4.0)).max(2.0);
@@ -7035,7 +9407,9 @@ fn voice_player(
                         );
                     }
                 }
-                if matches!(status.state, State::Playing | State::Paused) && rect.width() >= 10.0 {
+                if (!voice_note || matches!(status.state, State::Playing | State::Paused))
+                    && rect.width() >= 10.0
+                {
                     let knob = played_until.clamp(rect.left() + 5.0, rect.right() - 5.0);
                     ui.painter().circle_filled(
                         egui::pos2(knob, rect.center().y),
@@ -7081,8 +9455,24 @@ fn voice_player(
                         theme::tabular(fastframe_fonts::Weight::Regular, 11.5),
                     ),
                 };
-                theme::text(ui, text, font, palette.secondary);
+                duration = Some(theme::text(ui, text, font, palette.secondary).rect);
             });
+            if !voice_note {
+                let (slot, response) = ui.allocate_exact_size(Vec2::splat(button), Sense::hover());
+                let at = Rect::from_center_size(
+                    pos2(slot.center().x, wave_middle.unwrap_or(slot.center().y)),
+                    Vec2::splat(button),
+                );
+                ui.painter().circle_filled(at.center(), button / 2.0, fill);
+                theme::paint_icon(ui, Icon::Music, at, 20.0, palette.accent);
+                let label = crate::i18n::gettext(view.locale, "Audio");
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.as_ref())
+                });
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(bubble_id(&view.chat.id, &message.id).with("audio-file"), at);
+                });
+            }
             // Speed chip, cycling 1x, 1.5x, and 2x like the phone. The
             // message menu lists every speed, including 1.25x and 1.75x.
             if shows_chip {
@@ -7143,7 +9533,12 @@ fn voice_player(
                 // The row spans the bubble, so an outgoing bubble (which lays
                 // out from the right) still starts at the left, and the time's
                 // width stays empty at the right for the footer.
-                let time = footer_width(ui, message) + 10.0;
+                let time = footer_width(
+                    ui,
+                    message,
+                    view.starred.is_some_and(|stars| stars.contains(&message.id)),
+                    view.pins.is_some_and(|pins| pins.contains(&message.id)),
+                ) + 10.0;
                 let (row, _) = ui.allocate_exact_size(vec2(width.max(0.0), 22.0), Sense::hover());
                 let note = crate::i18n::gettext(locale, "Transcribed on this computer");
                 let galley = ui.painter().layout_no_wrap(
@@ -7224,12 +9619,26 @@ fn voice_player(
         && media.is_within_download_limit();
     if auto {
         actions.push(Action::Download {
+            manual: false,
             card: None,
             chat: view.chat.id.clone(),
             message: message.id.clone(),
         });
     }
-    footer_slot
+    // A finished transcript puts the time on its own last line; without one,
+    // the time and ticks share the duration's line, as on the phone. A long
+    // error leaves them no room, so they keep a line of their own.
+    footer_slot.or_else(|| {
+        let right = row.response.rect.right();
+        duration
+            .filter(|duration| duration.right() + 8.0 + reserve <= right)
+            .map(|duration| {
+                Rect::from_min_max(
+                    pos2(right - reserve, duration.center().y - 7.5),
+                    pos2(right, duration.center().y + 7.5),
+                )
+            })
+    })
 }
 
 /// Voice-recording controls and live waveform.
@@ -7372,6 +9781,28 @@ fn selection_bar(app: &mut App, ui: &mut egui::Ui, chat: &str, selected: &[Strin
                     messages: selected.to_vec(),
                 }));
             }
+            let delete = ui
+                .add_enabled_ui(!selected.is_empty(), |ui| {
+                    theme::pill_button(ui, &palette, "Delete…", false)
+                })
+                .inner;
+            // Demo/test: hold this menu open for a screenshot.
+            #[cfg(any(test, feature = "demo"))]
+            if app.open_selection_delete_menu {
+                egui::Popup::open_id(ui.ctx(), delete.id.with("popup"));
+            }
+            let can_revoke = app.conversations.get(chat).is_some_and(|conversation| {
+                selection_can_revoke(&conversation.messages, selected, crate::util::now())
+            });
+            let width = widgets::menu_width(ui, &["Delete for everyone", "Delete for me"], true);
+            let mut actions = Vec::new();
+            egui::Popup::menu(&delete)
+                .width(width)
+                .frame(widgets::menu_frame(&palette))
+                .show(|ui| {
+                    selection_delete_items(ui, &palette, chat, can_revoke, selected, &mut actions);
+                });
+            app.actions.extend(actions);
         });
     });
 }
@@ -7417,6 +9848,108 @@ fn chat_of(chat: &ChatId) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_read_receipt_privacy_hides_read_ticks_only_in_outgoing_dms() {
+        use crate::model::ChatKind;
+
+        assert_eq!(
+            display_delivery(Delivery::Read, true, ChatKind::Direct, true),
+            Delivery::Delivered
+        );
+        assert_eq!(
+            display_delivery(Delivery::Played, true, ChatKind::Direct, true),
+            Delivery::Played
+        );
+        assert_eq!(
+            display_delivery(Delivery::Read, true, ChatKind::Group, true),
+            Delivery::Read
+        );
+        assert_eq!(
+            display_delivery(Delivery::Read, false, ChatKind::Direct, true),
+            Delivery::Read
+        );
+        assert_eq!(
+            display_delivery(Delivery::Read, true, ChatKind::Direct, false),
+            Delivery::Read
+        );
+    }
+
+    #[test]
+    fn account_privacy_preserves_non_read_states_and_broadcasts() {
+        use crate::model::ChatKind;
+        for status in [
+            Delivery::None,
+            Delivery::Pending,
+            Delivery::Sent,
+            Delivery::Delivered,
+            Delivery::Played,
+            Delivery::Failed,
+        ] {
+            assert_eq!(
+                display_delivery(status, true, ChatKind::Direct, true),
+                status
+            );
+        }
+        assert_eq!(
+            display_delivery(Delivery::Read, true, ChatKind::Broadcast, true),
+            Delivery::Read
+        );
+    }
+
+    #[test]
+    fn batch_revoke_requires_every_selected_message_to_be_eligible() {
+        let now = crate::util::now();
+        let first = Message {
+            id: "first".into(),
+            chat: "synthetic-chat".into(),
+            sender: "me".into(),
+            sender_name: None,
+            from_me: true,
+            timestamp: now,
+            history_order: None,
+            content: Content::text("Synthetic message"),
+            status: Delivery::Sent,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        let mut second = first.clone();
+        second.id = "second".into();
+        let selected = vec!["first".into(), "second".into()];
+        assert!(selection_can_revoke(
+            &[first.clone(), second.clone()],
+            &selected,
+            now
+        ));
+        second.from_me = false;
+        assert!(!selection_can_revoke(
+            &[first.clone(), second.clone()],
+            &selected,
+            now
+        ));
+        second.from_me = true;
+        second.timestamp = now - crate::app::REVOKE_WINDOW.as_secs() as i64 - 1;
+        assert!(!selection_can_revoke(
+            &[first.clone(), second.clone()],
+            &selected,
+            now
+        ));
+        second.timestamp = now;
+        second.content = Content::Revoked;
+        assert!(!selection_can_revoke(
+            &[first.clone(), second],
+            &selected,
+            now
+        ));
+        assert!(!selection_can_revoke(&[first], &selected, now));
+        assert!(!selection_can_revoke(&[], &[], now));
+    }
 
     #[test]
     fn sender_pictures_show_in_groups_only() {
@@ -7568,15 +10101,157 @@ mod tests {
         assert_eq!(attachment_name(&document("  "), cached), "abc123.pdf");
     }
 
+    /// Builds synthetic attachment metadata for media-state and album regression tests.
     fn media(w: Option<u32>, h: Option<u32>) -> Media {
         Media {
             mime: "image/jpeg".into(),
             size: 1,
             width: w,
             height: h,
+            album: None,
             path: None,
             state: MediaState::Idle,
         }
+    }
+
+    /// Builds a synthetic picture belonging to a specified protocol album.
+    fn album_picture(id: &str, album: Option<&str>, sender: &str) -> Message {
+        let mut attachment = media(Some(640), Some(480));
+        attachment.album = album.map(str::to_owned);
+        Message {
+            id: id.into(),
+            chat: "chat@example".into(),
+            sender: sender.into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: 1,
+            history_order: None,
+            content: Content::Image {
+                motion: None,
+                caption: None,
+                media: attachment,
+            },
+            status: Delivery::None,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        }
+    }
+
+    /// Checks that consecutive compatible media sharing an album parent are displayed together.
+    #[test]
+    fn consecutive_items_with_the_same_protocol_album_are_grouped() {
+        let messages = vec![
+            album_picture("one", Some("album-1"), "alice"),
+            album_picture("two", Some("album-1"), "alice"),
+            album_picture("three", Some("album-2"), "alice"),
+        ];
+        assert_eq!(album_run(&messages, 0).map(<[Message]>::len), Some(2));
+        assert!(album_run(&messages, 2).is_none());
+    }
+
+    /// A protocol album splits at the local day boundary even when its identity stays the same.
+    #[test]
+    fn album_runs_stop_at_the_local_calendar_day_boundary() {
+        let (_, midnight) = crate::util::day_bounds(jiff::civil::date(2026, 9, 20)).unwrap();
+        let mut messages: Vec<_> = ["one", "two", "three", "four"]
+            .iter()
+            .map(|id| album_picture(id, Some("album-1"), "alice"))
+            .collect();
+        for (message, offset) in messages.iter_mut().zip([-2, -1, 1, 2]) {
+            message.timestamp = midnight + offset;
+        }
+        assert_eq!(album_run(&messages, 0).map(<[Message]>::len), Some(2));
+        assert_eq!(album_run(&messages, 2).map(<[Message]>::len), Some(2));
+        assert!(album_run(&messages[1..3], 0).is_none());
+    }
+
+    /// Checks that grouping never combines unrelated pictures or messages from different senders.
+    #[test]
+    fn unrelated_or_different_sender_pictures_are_not_grouped() {
+        let unrelated = vec![
+            album_picture("one", None, "alice"),
+            album_picture("two", None, "alice"),
+        ];
+        assert!(album_run(&unrelated, 0).is_none());
+        let senders = vec![
+            album_picture("one", Some("album-1"), "alice"),
+            album_picture("two", Some("album-1"), "bob"),
+        ];
+        assert!(album_run(&senders, 0).is_none());
+    }
+
+    fn message(content: Content) -> Message {
+        Message {
+            id: "m1".into(),
+            chat: "peer@s.whatsapp.net".into(),
+            sender: "me".into(),
+            sender_name: None,
+            from_me: true,
+            timestamp: 0,
+            content,
+            status: Delivery::None,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+            history_order: None,
+        }
+    }
+
+    /// The menu offers the viewer for a message the album takes and a file
+    /// that is still on disk. A recorded path whose file was deleted elsewhere
+    /// offers nothing, or the click would fall back to opening a file that is
+    /// not there.
+    #[test]
+    fn the_viewer_item_needs_a_file_that_is_still_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let picture = |path: &Path| {
+            message(Content::Image {
+                media: Media {
+                    path: Some(path.to_path_buf()),
+                    ..media(None, None)
+                },
+                caption: None,
+                motion: None,
+            })
+        };
+
+        let photo = dir.path().join("photo.png");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        let downloaded = picture(&photo);
+        assert_eq!(viewer_file(&downloaded), Some(photo.as_path()));
+
+        let deleted = dir.path().join("deleted.png");
+        let gone = picture(&deleted);
+        assert_eq!(
+            viewer_file(&gone),
+            None,
+            "a path with no file offers nothing"
+        );
+
+        // A GIF plays inline as an animation, so the album leaves it out.
+        let animation = dir.path().join("animation.gif");
+        std::fs::write(&animation, b"gif").unwrap();
+        let inline = picture(&animation);
+        assert_eq!(viewer_file(&inline), None);
+
+        // Neither does a message whose file was never downloaded.
+        let pending = message(Content::Image {
+            media: media(None, None),
+            caption: None,
+            motion: None,
+        });
+        assert_eq!(viewer_file(&pending), None);
     }
 
     #[test]
@@ -7657,6 +10332,273 @@ mod tests {
         assert!(!reaction_affordance_visible(None, bubble, button));
     }
 
+    /// One pinned row, as the archive hands it over.
+    fn pinned(chat: &str, id: &str) -> crate::archive::Pinned {
+        crate::archive::Pinned {
+            chat: chat.to_owned(),
+            id: id.to_owned(),
+            pinned_at: 1,
+            expires_at: i64::MAX,
+            text: format!("message {id}"),
+            from_me: false,
+            sent_at: 1,
+            pinner: crate::archive::Pinner {
+                by_me: true,
+                sender: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_pin_notice_names_who_pinned_the_message() {
+        let names = |id: &str, _: Option<&str>| id.split('@').next().unwrap_or(id).to_owned();
+        let mut row = pinned("1@s.whatsapp.net", "m1");
+        assert_eq!(
+            pin_notice_label(crate::i18n::Locale::English, &row, &names),
+            "You pinned a message"
+        );
+
+        row.pinner = crate::archive::Pinner {
+            by_me: false,
+            sender: "bob@s.whatsapp.net".to_owned(),
+        };
+        assert_eq!(
+            pin_notice_label(crate::i18n::Locale::English, &row, &names),
+            "bob pinned a message"
+        );
+
+        // An archive that does not say who pinned it still shows the pin.
+        row.pinner.sender.clear();
+        assert_eq!(
+            pin_notice_label(crate::i18n::Locale::English, &row, &names),
+            "A message was pinned"
+        );
+    }
+
+    #[test]
+    fn an_expired_pin_leaves_the_line_under_the_header() {
+        let mut gone = pinned("1@s.whatsapp.net", "m2");
+        gone.expires_at = 1_000;
+        let mut live = pinned("1@s.whatsapp.net", "m1");
+        live.expires_at = 2_000;
+
+        let rows = live_pins(&[gone, live.clone()], 1_500);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "m1");
+        assert!(
+            live_pins(&[live], 2_000).is_empty(),
+            "the moment it runs out, it leaves"
+        );
+    }
+
+    #[test]
+    fn an_open_pin_asks_for_a_frame_when_it_expires() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = App::headless(
+            crate::paths::AppDirs::under(directory.path()),
+            crate::settings::Settings::default(),
+        );
+        let chat = Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        let mut row = pinned(&chat.id, "m1");
+        row.expires_at = crate::util::now() + 30;
+        app.chat_pins.insert(chat.id.clone(), vec![row]);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            pin_banner(&mut app, ui, &chat);
+        });
+        output.textures_delta.clear();
+        let delay = output
+            .viewport_output
+            .values()
+            .map(|viewport| viewport.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
+        assert!(
+            delay.as_secs() <= 31,
+            "the banner wakes when the pin runs out"
+        );
+    }
+
+    #[test]
+    fn a_pin_notice_sits_above_the_message_that_followed_its_pin() {
+        // `chat_pins` hands the newest pin over first. A pin at 100 and one at
+        // 500 belong above the messages at 200 and 600, one each.
+        let mut newest_first = vec![
+            pinned("1@s.whatsapp.net", "c"),
+            pinned("1@s.whatsapp.net", "a"),
+        ];
+        newest_first[0].pinned_at = 500;
+        newest_first[1].pinned_at = 100;
+
+        let ordered = pin_notices_in_time_order(&newest_first);
+        assert_eq!(
+            ordered.iter().map(|row| row.pinned_at).collect::<Vec<_>>(),
+            [100, 500],
+            "the list goes back into time order before it is placed"
+        );
+        assert_eq!(notices_above(&ordered[..], 200), 1, "one notice above 200");
+        assert_eq!(notices_above(&ordered[1..], 600), 1, "and one above 600");
+
+        // Handed over unsorted, both would pile above the later message, which
+        // is the bug this keeps out.
+        assert_eq!(notices_above(&newest_first[..], 200), 0);
+    }
+
+    #[test]
+    fn the_pin_line_shows_the_newest_pin_and_a_click_walks_the_rest() {
+        let rows = vec![
+            pinned("1@s.whatsapp.net", "newest"),
+            pinned("1@s.whatsapp.net", "middle"),
+            pinned("1@s.whatsapp.net", "oldest"),
+        ];
+        // Nothing shown yet, or the shown pin gone: the newest.
+        assert_eq!(shown_pin(&rows, None), 0);
+        assert_eq!(shown_pin(&rows, Some("unpinned")), 0);
+        assert_eq!(shown_pin(&rows, Some("middle")), 1);
+        // Each click moves on to the next older pin and wraps to the newest.
+        assert_eq!(next_pin(3, 0), 1);
+        assert_eq!(next_pin(3, 1), 2);
+        assert_eq!(next_pin(3, 2), 0);
+        // One pin is its own next pin.
+        assert_eq!(next_pin(1, 0), 0);
+    }
+
+    #[test]
+    fn the_pin_bar_has_a_segment_per_pin_inside_the_line() {
+        for count in 1..=3 {
+            let segments = pin_bar_segments(10.0, 28.0, count);
+            assert_eq!(segments.len(), count);
+            assert!((segments[0].0 - 10.0).abs() < 0.01);
+            assert!((segments[count - 1].1 - 38.0).abs() < 0.01, "{segments:?}");
+            for pair in segments.windows(2) {
+                assert!(pair[1].0 > pair[0].1, "segments do not touch: {segments:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_on_the_pin_line_opens_the_pin_and_shows_the_next() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = App::headless(
+            crate::paths::AppDirs::under(directory.path()),
+            crate::settings::Settings::default(),
+        );
+        let chat = Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        app.chat_pins.insert(
+            chat.id.clone(),
+            vec![pinned(&chat.id, "newest"), pinned(&chat.id, "older")],
+        );
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 400.0));
+        // Clicks a second apart, so none of them counts as a double click.
+        let clock = std::cell::Cell::new(0.0);
+        let frame = |events: Vec<egui::Event>, app: &mut App, step: f64| {
+            clock.set(clock.get() + step);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(clock.get()),
+                    events,
+                    ..Default::default()
+                },
+                |ui| pin_banner(app, ui, &chat),
+            );
+            output.textures_delta.clear();
+        };
+        let at = pos2(300.0, PIN_ROW_HEIGHT / 2.0);
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // The line has to be laid out once before it can take a click.
+        frame(vec![egui::Event::PointerMoved(at)], &mut app, 1.0);
+        let mut opened = Vec::new();
+        for _ in 0..3 {
+            frame(
+                vec![egui::Event::PointerMoved(at), press(true)],
+                &mut app,
+                1.0,
+            );
+            frame(vec![press(false)], &mut app, 0.05);
+            for action in app.actions.drain(..) {
+                if let Action::OpenMessage { message, .. } = action {
+                    opened.push(message);
+                }
+            }
+        }
+        assert_eq!(opened, ["newest", "older", "newest"]);
+    }
+
+    #[test]
+    fn the_footer_takes_a_slot_only_for_the_marks_on_the_bubble() {
+        let ctx = egui::Context::default();
+        let mut clock = 0.0;
+        let mut plain = 0.0;
+        let mut pinned = 0.0;
+        let mut both = 0.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let message = crate::archive::tests::message("1@s.whatsapp.net", "m1", 0, false);
+                clock = clock_width(ui, &message);
+                plain = footer_width(ui, &message, false, false);
+                pinned = footer_width(ui, &message, false, true);
+                both = footer_width(ui, &message, true, true);
+            },
+        );
+        output.textures_delta.clear();
+        // Measured against the clock the reader's own format produces, not a
+        // number that only holds on a 24-hour one: the same footer is a third
+        // wider where the system shows "12:00 AM".
+        assert!(
+            (plain - clock).abs() < 0.01,
+            "a message without a mark is just the clock, {plain} vs {clock}"
+        );
+        assert!(
+            (pinned - clock - FOOTER_MARK_SLOT).abs() < 0.5,
+            "a pin takes one slot, {pinned} vs {clock}"
+        );
+        assert!(
+            (both - clock - FOOTER_MARK_SLOT * 2.0).abs() < 0.5,
+            "a star and a pin take one slot each, {both} vs {clock}"
+        );
+    }
+
+    #[test]
+    fn the_footer_paints_a_pin_mark_when_the_message_is_pinned() {
+        let ctx = egui::Context::default();
+        with_still_view(|view| {
+            let shapes = |pinned: bool| {
+                let message = crate::archive::tests::message("1@s.whatsapp.net", "m1", 0, false);
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(400.0, 200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        footer(ui, view, &message, None, false, pinned, &mut Vec::new());
+                    },
+                );
+                output.textures_delta.clear();
+                output.shapes.len()
+            };
+            assert_eq!(
+                shapes(true),
+                shapes(false) + 1,
+                "a pinned message paints one extra mark"
+            );
+        });
+    }
+
     #[test]
     fn picture_frames_keep_their_shape_within_the_limit() {
         let landscape = frame_size(&media(Some(1600), Some(1200)), None, 340.0, PICTURE_HEIGHT);
@@ -7671,6 +10613,174 @@ mod tests {
         assert!(unknown.x > unknown.y);
         let tiny = frame_size(&media(Some(40), Some(40)), None, 340.0, PICTURE_HEIGHT);
         assert!(tiny.x >= 120.0);
+    }
+
+    #[test]
+    fn the_footer_reserves_a_slot_only_when_the_message_is_starred() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut clock = 0.0;
+        let mut incoming = 0.0;
+        let mut starred = 0.0;
+        let mut own = 0.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let from_them = crate::archive::tests::message("1@s.whatsapp.net", "m1", 0, false);
+                let from_me = crate::archive::tests::message("1@s.whatsapp.net", "m1", 0, true);
+                clock = clock_width(ui, &from_them);
+                incoming = footer_width(ui, &from_them, false, false);
+                starred = footer_width(ui, &from_them, true, false);
+                own = footer_width(ui, &from_me, false, false);
+            },
+        );
+        output.textures_delta.clear();
+        // Measured against the clock the reader's own format produces, not a
+        // number that only holds on a 24-hour one: the same footer is a third
+        // wider where the system shows "12:00 AM".
+        assert!(
+            (incoming - clock).abs() < 0.01,
+            "a plain incoming footer is just the clock, {incoming} vs {clock}"
+        );
+        assert!(
+            (starred - clock - FOOTER_MARK_SLOT).abs() < 0.5,
+            "a star adds one mark slot, {starred} vs {clock}"
+        );
+        assert!(
+            (own - incoming - 19.0).abs() < 0.5,
+            "our own messages add the delivery ticks, {own} vs {incoming}"
+        );
+    }
+
+    /// Runs `check` with a still view of one plain chat, as a footer test
+    /// needs one to paint into.
+    fn with_still_view(check: impl FnOnce(&View<'_>)) {
+        let directory = tempfile::tempdir().unwrap();
+        let (app, _events) = App::headless(
+            crate::paths::AppDirs::under(directory.path()),
+            crate::settings::Settings::default(),
+        );
+        let chat = Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        let names_or = |id: &str, hint: Option<&str>| app.display_name_or(id, hint);
+        let mention_names = |id: &str| app.mention_name(id);
+        let avatars = HashMap::new();
+        let keyboard_navigation = std::cell::Cell::new(false);
+        let view = View {
+            palette: Palette::dark(),
+            locale: app.locale,
+            chat: &chat,
+            me: None,
+            auto_download: app.settings.auto_download,
+            connected: false,
+            poll_voting: &app.poll_voting,
+            interactive_pending: &app.interactive_sending,
+            anchor: None,
+            open_menu: None,
+            reaction: None,
+            reaction_menu: false,
+            reaction_emoji: &app.settings.reaction_emoji,
+            keyboard_navigation: &keyboard_navigation,
+            names_or: &names_or,
+            mention_names: &mention_names,
+            avatars: &avatars,
+            contacts: &app.contacts,
+            now: 0,
+            animate: false,
+            player: &app.player,
+            video: &app.video,
+            account_receipts_off: false,
+            copy_rows: Some(app.copy_rows.as_ref()),
+            selecting: false,
+            motion_playing: None,
+            starred: None,
+            pins: None,
+            pin_notices: &[],
+        };
+        check(&view);
+    }
+
+    #[test]
+    fn the_footer_paints_a_star_mark_when_the_message_is_starred() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        with_still_view(|view| {
+            let shapes = |starred: bool| {
+                let message = crate::archive::tests::message("1@s.whatsapp.net", "m1", 0, false);
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(400.0, 200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        footer(ui, view, &message, None, starred, false, &mut Vec::new());
+                    },
+                );
+                output.textures_delta.clear();
+                output.shapes.len()
+            };
+            assert_eq!(shapes(true), shapes(false) + 1, "a star paints one mark");
+        });
+    }
+
+    #[test]
+    fn a_picture_without_a_caption_paints_the_marks_it_carries() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        with_still_view(|view| {
+            let shapes = |starred: bool, pinned: bool| {
+                let message = crate::archive::tests::message("1@s.whatsapp.net", "m1", 0, false);
+                let picture = Rect::from_min_size(egui::Pos2::ZERO, vec2(240.0, 180.0));
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(400.0, 200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        footer_over_picture(
+                            ui,
+                            view,
+                            &message,
+                            picture,
+                            starred,
+                            pinned,
+                            &mut Vec::new(),
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                output.shapes.len()
+            };
+            assert_eq!(
+                shapes(true, false),
+                shapes(false, false) + 1,
+                "a star on a picture paints one mark"
+            );
+            assert_eq!(
+                shapes(false, true),
+                shapes(false, false) + 1,
+                "a pin on a picture paints one mark"
+            );
+            assert_eq!(
+                shapes(true, true),
+                shapes(false, false) + 2,
+                "both marks on a picture paint both"
+            );
+        });
+    }
+
+    #[test]
+    fn the_star_mark_tint_is_not_the_secondary() {
+        let palette = Palette::dark();
+        assert_ne!(FOOTER_STAR, palette.secondary);
     }
 
     #[test]
@@ -7698,12 +10808,12 @@ mod tests {
         };
         let mut widths = Vec::new();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            widths.push(footer_width(ui, &message));
+            widths.push(footer_width(ui, &message, false, false));
             message.status = Delivery::Failed;
-            widths.push(footer_width(ui, &message));
+            widths.push(footer_width(ui, &message, false, false));
             // Only our own messages can fail to send.
             message.from_me = false;
-            widths.push(footer_width(ui, &message) + 19.0);
+            widths.push(footer_width(ui, &message, false, false) + 19.0);
         });
         output.textures_delta.clear();
         assert!(widths[1] > widths[0] + 30.0, "{widths:?}");
@@ -7728,6 +10838,55 @@ mod tests {
         output.textures_delta.clear();
         let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
         assert_eq!(delay, std::time::Duration::ZERO);
+    }
+
+    /// With a screen reader attached the dots ask for a frame a step later,
+    /// and each stepped frame draws exactly what an every-frame one would at
+    /// that moment, so the wave keeps its speed and only skips frames.
+    #[test]
+    fn typing_dots_step_with_a_screen_reader_and_keep_their_phase() {
+        let palette = crate::theme::Palette::dark();
+        let draw = |reader: bool, time: f64| {
+            let ctx = crate::motion::tests::reading(reader);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| typing_dots(ui, &palette),
+            );
+            output.textures_delta.clear();
+            let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            let dots: Vec<_> = output
+                .shapes
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::Shape::Circle(circle) => Some((circle.center, circle.fill)),
+                    _ => None,
+                })
+                .collect();
+            (delay, dots)
+        };
+        let mut seen = Vec::new();
+        for step in 0..12 {
+            let time = 5.0 + f64::from(step) * 0.1;
+            let (plain_delay, plain) = draw(false, time);
+            let (stepped_delay, stepped) = draw(true, time);
+            assert_eq!(plain_delay, std::time::Duration::ZERO);
+            assert!(
+                stepped_delay > std::time::Duration::from_millis(75)
+                    && stepped_delay <= crate::motion::STEP,
+                "{stepped_delay:?}"
+            );
+            assert_eq!(stepped.len(), 3);
+            assert_eq!(plain, stepped, "at {time}");
+            seen.push(format!("{stepped:?}"));
+        }
+        // Over one 1.2 s wave the steps show it moving: only while all three
+        // dots rest at the bottom do two steps look alike.
+        seen.sort();
+        seen.dedup();
+        assert!(seen.len() >= 9, "{} different steps", seen.len());
     }
 
     #[test]
@@ -7819,6 +10978,143 @@ mod reaction_tests {
         }
     }
 
+    /// The tail goes to a run's last bubble, past the messages drawn without
+    /// one after it, and only to one in the same run.
+    #[test]
+    fn the_tail_goes_to_the_last_bubble_of_a_run() {
+        let photo = Message {
+            id: "photo".into(),
+            content: Content::Image {
+                caption: None,
+                media: crate::model::Media {
+                    album: None,
+                    mime: "image/jpeg".into(),
+                    size: 1,
+                    width: None,
+                    height: None,
+                    path: None,
+                    state: crate::model::MediaState::Idle,
+                },
+                motion: None,
+            },
+            ..with_reactions(Vec::new())
+        };
+        let text = with_reactions(Vec::new());
+        let mine = Message {
+            from_me: true,
+            ..with_reactions(Vec::new())
+        };
+        let messages = Palette::messages();
+        // Text, then a lone photo in the same run: the text keeps the tail.
+        let run = [text.clone(), photo.clone()];
+        assert!(last_bubble_of_run(&messages, &run, 0));
+        // Text, text: only the second.
+        let run = [text.clone(), text.clone()];
+        assert!(!last_bubble_of_run(&messages, &run, 0));
+        assert!(last_bubble_of_run(&messages, &run, 1));
+        // A photo, then text of the other side: the run ends, the text tails.
+        let run = [text.clone(), photo.clone(), mine, text.clone()];
+        assert!(last_bubble_of_run(&messages, &run, 0));
+        // WhatsApp frames the photo, so there it is the last bubble.
+        assert!(!last_bubble_of_run(
+            &Palette::dark(),
+            &[text.clone(), photo.clone()],
+            0
+        ));
+    }
+
+    /// The avatar Messages puts beside a run goes to its last message,
+    /// bubble or not, and a run ends with another sender or another day.
+    #[test]
+    fn a_run_ends_with_its_last_message() {
+        let from = |sender: &str, timestamp: i64| Message {
+            sender: sender.into(),
+            timestamp,
+            ..with_reactions(Vec::new())
+        };
+        let run = [
+            from("a", 0),
+            from("a", 60),
+            from("b", 120),
+            from("b", 2 * 86_400),
+        ];
+        assert!(!last_of_run(&run, 0));
+        assert!(last_of_run(&run, 1));
+        // Another day starts another run, from the same sender too.
+        assert!(last_of_run(&run, 2));
+        assert!(last_of_run(&run, 3));
+    }
+
+    /// Messages draws a photo alone in its message without a bubble, with
+    /// a bubble's corners; anything else in the message keeps the bubble.
+    /// A quote on your own Messages balloon is white on its blue, in both
+    /// appearances; on others' balloons and in WhatsApp's style it keeps the
+    /// quoted sender's colour.
+    #[test]
+    fn quotes_on_own_messages_balloons_are_white() {
+        let tint = Color32::from_rgb(0x80, 0x40, 0xc0);
+        for palette in [Palette::messages(), Palette::messages_light()] {
+            let own = quote_colours(&palette.on_bubble(true), true, || tint);
+            assert_eq!(own.name, Color32::WHITE);
+            assert_eq!(own.text, Color32::WHITE.gamma_multiply(0.6));
+            assert_eq!(own.bar, Color32::WHITE.gamma_multiply(0.6));
+            assert_eq!(own.fill, Color32::WHITE.gamma_multiply(0.15));
+            let theirs = quote_colours(&palette.on_bubble(false), false, || tint);
+            assert_eq!((theirs.name, theirs.bar), (tint, tint));
+        }
+        for palette in [Palette::dark(), Palette::light()] {
+            let own = quote_colours(&palette.on_bubble(true), true, || tint);
+            assert_eq!((own.name, own.bar), (tint, tint));
+            assert_eq!(own.fill, palette.window.gamma_multiply(0.35));
+        }
+    }
+
+    #[test]
+    fn only_lone_pictures_stand_without_a_bubble_in_messages() {
+        let photo = |caption: Option<&str>| Message {
+            content: Content::Image {
+                caption: caption.map(Into::into),
+                media: crate::model::Media {
+                    album: None,
+                    mime: "image/jpeg".into(),
+                    size: 1,
+                    width: None,
+                    height: None,
+                    path: None,
+                    state: crate::model::MediaState::Idle,
+                },
+                motion: None,
+            },
+            ..with_reactions(Vec::new())
+        };
+        let messages = Palette::messages();
+        assert!(bare_picture(&messages, &photo(None)));
+        assert_eq!(
+            picture_radius(&messages, &photo(None)),
+            f32::from(widgets::MESSAGES_BUBBLE_RADIUS)
+        );
+        assert!(bare_picture(&Palette::messages_light(), &photo(None)));
+        // WhatsApp's bubbles keep their frame around every picture.
+        assert!(!bare_picture(&Palette::dark(), &photo(None)));
+        assert_eq!(picture_radius(&Palette::dark(), &photo(None)), 6.0);
+        // A caption, a quote or the forwarded label keep the bubble.
+        assert!(!bare_picture(&messages, &photo(Some("Look"))));
+        let mut forwarded = photo(None);
+        forwarded.forwarded = true;
+        assert!(!bare_picture(&messages, &forwarded));
+        let mut quoting = photo(None);
+        quoting.quoted = Some(crate::model::Quoted {
+            chat: None,
+            id: "q".into(),
+            sender: "a@s.whatsapp.net".into(),
+            sender_name: None,
+            summary: "hi".into(),
+            mentions: Vec::new(),
+        });
+        assert!(!bare_picture(&messages, &quoting));
+        assert!(!bare_picture(&messages, &with_reactions(Vec::new())));
+    }
+
     #[test]
     fn only_our_own_reaction_counts_as_chosen() {
         let message = with_reactions(vec![reaction(false, "😂"), reaction(true, "❤️")]);
@@ -7864,6 +11160,13 @@ mod reaction_tests {
         assert!(!message.reactions[0].from_me);
         assert_eq!(quick_reactions(&message, &[]), QUICK_REACTIONS.to_vec());
     }
+
+    #[test]
+    fn the_message_menu_measures_star_and_unstar() {
+        let labels = message_menu_labels(crate::i18n::Locale::German);
+        assert!(labels.iter().any(|label| label == "Markierung entfernen"));
+        assert!(labels.iter().any(|label| label == "Markieren"));
+    }
 }
 
 /// Pending attachment tiles above the composer.
@@ -7871,10 +11174,24 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let tile = 72.0;
     let mut remove = None;
+    let mut open = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
         for (index, item) in app.pending.iter_mut().enumerate() {
-            let (rect, response) = ui.allocate_exact_size(Vec2::splat(tile), Sense::hover());
+            // A picture can be cropped before it goes out. Anything else
+            // cannot, and does not pretend to be clickable.
+            let editable = match &item.item {
+                crate::app::Pending::Picture { .. } => true,
+                crate::app::Pending::File(path) => crate::app::Pending::is_picture_file(path),
+                // A document goes as the file it is, so it is not edited here.
+                crate::app::Pending::Document(_) => false,
+            };
+            let sense = if editable {
+                Sense::click()
+            } else {
+                Sense::hover()
+            };
+            let (rect, response) = ui.allocate_exact_size(Vec2::splat(tile), sense);
             if ui.is_rect_visible(rect) {
                 // Lifted off the chat like a bubble, with a bubble's corners.
                 let radius = CornerRadius::same(widgets::BUBBLE_RADIUS);
@@ -7886,7 +11203,9 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
                     palette.raised_edge(palette.surface),
                 );
                 ui.painter().rect_filled(rect, radius, palette.surface);
-                match item {
+                // A document shows as the file it arrives as, even a picture.
+                let document = matches!(item.item, crate::app::Pending::Document(_));
+                match &mut item.item {
                     crate::app::Pending::Picture {
                         width,
                         height,
@@ -7939,8 +11258,8 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
                             .corner_radius(6.0)
                             .paint_at(ui, inner);
                     }
-                    crate::app::Pending::File(path) => {
-                        if crate::app::Pending::is_picture_file(path) {
+                    crate::app::Pending::File(path) | crate::app::Pending::Document(path) => {
+                        if !document && crate::app::Pending::is_picture_file(path) {
                             widgets::file_image(ui, path)
                                 .fit_to_exact_size(Vec2::splat(tile - 8.0))
                                 .corner_radius(6.0)
@@ -7974,11 +11293,24 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
                         }
                     }
                 }
+                if editable && response.hovered() {
+                    // A picture that can be cropped says so, rather than
+                    // looking like every other tile.
+                    let dim = palette.shadow.gamma_multiply(1.4);
+                    ui.painter().rect_filled(rect, radius, dim);
+                    theme::paint_icon(
+                        ui,
+                        Icon::Pencil,
+                        Rect::from_center_size(rect.center(), Vec2::splat(22.0)),
+                        20.0,
+                        palette.text,
+                    );
+                }
                 // Remove button in the corner.
                 let close =
                     Rect::from_center_size(rect.right_top() + vec2(-10.0, 10.0), Vec2::splat(18.0));
                 let close_response =
-                    ui.interact(close, ui.id().with(("unstage", index)), Sense::click());
+                    ui.interact(close, ui.id().with(("unstage", item.id)), Sense::click());
                 ui.painter()
                     .circle_filled(close.center(), 9.0, palette.overlay);
                 theme::paint_icon(ui, Icon::X, close, 12.0, palette.text);
@@ -7987,13 +11319,17 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
                     .clicked()
                 {
                     remove = Some(index);
+                } else if response.clicked() {
+                    open = Some(item.id);
                 }
             }
-            let _ = response;
         }
     });
     if let Some(index) = remove {
         app.actions.push(Action::RemovePending(index));
+    }
+    if let Some(target) = open {
+        app.actions.push(Action::EditPicture(target));
     }
     ui.add_space(4.0);
 }

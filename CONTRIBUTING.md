@@ -50,8 +50,11 @@ release status stated. Reopen the issue if it persists after updating.
    must keep compiling.
 5. **Small dependency surface.** Reuse the standard library and existing
    crates where practical. A new dependency needs a concrete benefit worth its
-   build time, binary size, maintenance, and security cost. Do not vendor or
-   fork upstream crates such as egui.
+   build time, binary size, maintenance, and security cost. Crates come from
+   crates.io or from repositories under `github.com/crmne/`; never vendor
+   dependency source or point a dependency at another fork. To fix a
+   dependency, send the fix upstream and ask the maintainer to carry it in a
+   crmne fork until a release includes it. CI fails on any other source.
 6. **Private data.** The archive is personal data. Never log message contents,
    phone numbers, keys, or QR payloads.
 
@@ -80,7 +83,16 @@ screenshots or a short recording **in the pull request description**. Capture
 them with the `demo` feature (`cargo run --features demo -- --demo`, or
 `--demo-shot` for a headless capture) so they show only synthetic content, and
 include light and dark themes when colours or layout change. Do not commit
-screenshots, recordings, or other media to the repository.
+screenshots, recordings, comparison pages, or other review media to the
+repository: CI fails on media under `docs/` that no page uses, and on images,
+videos or HTML pages named like review evidence.
+
+An interactive HTML comparison, with theme and size selectors and Before and
+After buttons or a slider, helps with larger changes. Attach it to the pull
+request as one self-contained `.html` file with the captures embedded, which
+GitHub hands readers as a download to open in a browser, or publish it
+elsewhere, for example with GitHub Pages from your fork, and link it from the
+description. A gist does not work: GitHub shows its HTML as source.
 
 ### Checks
 

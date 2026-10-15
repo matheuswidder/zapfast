@@ -9,8 +9,19 @@ protocol. These notes are for coding agents and new contributors.
 - Keep it a small native client. No browser engine, no telemetry, no
   hosted backend, no ZapFast-operated account system. Features never send
   message content to a third party.
-- Do not vendor, fork, or patch upstream crates (egui, epaint, whatsapp-rust)
-  in this repository. Fix them upstream.
+- Do not copy dependency source into this repository. For a dependency fix,
+  use a fork under `github.com/crmne/` pinned to a commit and contribute the
+  fix upstream; egui, winit, whatsapp-rust and rodio already come from such
+  forks. Only the maintainer creates those forks; in a contributor's pull
+  request, send the fix upstream and ask for it to be carried. Use the fork
+  until a release includes the fix. Never point a dependency at any other
+  fork or source: `.github/scripts/check-dependency-sources.py` fails CI on
+  one.
+- Screenshots, captures, comparison pages and recordings made for a review
+  go in the pull request, never the repository:
+  `.github/scripts/check-review-evidence.py` fails CI on any file under
+  `docs/assets/`, or image or video elsewhere under `docs/`, that no page,
+  top-level file or packaging metadata uses.
 - The protocol comes from whatsapp-rust. Do not reimplement pieces of it
   here, and do not advertise a capability merely because a protobuf field
   for it exists.
@@ -52,11 +63,21 @@ protocol. These notes are for coding agents and new contributors.
   `AccountId`. `src/app.rs` is the process shell (theme, window, tray,
   updates). Each `Account` in `src/account.rs` owns a `Backend`/`Worker`.
   Views draw the active account through `App`'s `Deref` to `Account`.
-  Our own avatar at the top of the chat list opens the account switcher
-  (`src/ui/accounts.rs`) on every platform: only the accounts (picture, name
-  or number, unread chats, a check on the one on screen) and Add account; the
-  settings keep their own button. A dot on the avatar means another account
-  has unread chats. Events from an account that is not on screen are
+  A navigation rail (`src/ui/rail.rs`) runs down the left of the chat list
+  on every platform, 52 points wide and a shade darker than the list:
+  Chats, Calls and Starred at the top, the one on screen lit (Calls and
+  Starred are left through Chats or Escape, never toggled); Archived and
+  Locked (while there are such chats; they open in the list column),
+  Settings and our own avatar at the bottom. While the list is hidden the
+  chats' avatars fill it between the two (`chats::compact_list`); beside the
+  list they would only repeat it. On macOS the traffic lights reach
+  past it over the header beside it, which leaves `rail::lights_overhang`
+  free; a narrow window hides the rail with the list. The Calls tab keeps
+  the open chat beside its history (`App::chat_view`), and a picked call row
+  opens its chat there. Our avatar opens the account switcher
+  (`src/ui/accounts.rs`): only the accounts (picture, name or number, unread
+  chats, a check on the one on screen) and Add account. A dot on the avatar
+  means another account has unread chats. Events from an account that is not on screen are
   applied with `App::events_hidden` set: they update that account only, never
   the window's composer, dialogs, playback, or read state (a hidden account's
   remembered chat is not being read, so it sends no receipts). Process-wide
@@ -77,6 +98,13 @@ protocol. These notes are for coding agents and new contributors.
   a disposable archive. Tests use fixtures and mock credentials only.
 - `src/model.rs` holds the app's own types. Views never touch a protobuf;
   the worker translates in `classify()` and `parse_conversation()`.
+- A motion photo is a photo plus a short clip sent as a second message in an
+  `associatedChildMessage` wrapper. The clip is never a message: its bare
+  video message goes to the archive's `motion_clips`, keyed by chat, photo id,
+  and sender, and only the photo's own sender gives it a clip. `Content::Image`
+  carries `motion`; the badge downloads the clip on a click
+  (`Command::DownloadMotion`, cache only, same limit) and plays it muted through
+  `animation::frame`; the image preview plays it through `Action::ExpandVideo`. Other wrapped children are not handled.
 - Individual **Delete for me** uses `Command::DeleteLocal` to send through
   `chat_actions().delete_message_for_me`, removing the local copy only after
   WhatsApp accepts it. `DeleteMessageForMeUpdate` applies deletions from other
@@ -111,6 +139,77 @@ protocol. These notes are for coding agents and new contributors.
   The version-4 backfill preserves those paths when rebuilding derived content.
   See [compatibility notes](docs/interactive-message-actions.md) for response
   families, source references, and live-test limits.
+- Calls use whatsapp-rust's `voip` feature (`Client::voip()`): signaling,
+  keys, the relay transport and the codecs are the library's, never ours.
+  `src/calls.rs` is one call's phase machine, fed only by the protocol's own
+  stanzas and media events (a relay alone is not an answered call). The one
+  local phase is `Placing`: the window draws it ("Connecting…") the moment a
+  call button is pressed, under a generation it takes from
+  `calls::next_generation` and hands the worker in `Command::StartCall`, with
+  a cancel flag that keeps a call hung up while placing from being offered;
+  every way placing stops short answers with that generation failed. Ringing
+  is the peer's `<preaccept>`. A call hung up or declined here leaves the
+  screen at once, any other end after `CALL_FAREWELL` (1.5 s).
+  `src/call_tones.rs` synthesises the ETSI ringback (while `Ringing`) and
+  the incoming ringtone (while the call's notification may sound) on the
+  default output, and only tracks them in tests and demos;
+  `src/call_audio.rs` bridges the engine's 16 kHz frames to rodio's
+  microphone and speaker behind stable channels, so a device change rebinds
+  a stream instead of the call. `backend/worker/calls.rs` owns at most one
+  call per account; the window (`app/calls.rs`) holds one call across all
+  accounts with its `AccountId`, routes call actions to that account's
+  backend, and declines another account's offer while one is up. Group
+  calls: an offer carrying a roster (`IncomingCall::group`) or a `group-jid`
+  rings under its group (a call among several people with no group, under its
+  creator's chat), named by `chat_title_of` with the member who rang, and is
+  answered through the same `voip().accept`, which joins the shared relay and
+  epoch key; the library mixes everyone's audio into the one speaker stream.
+  `calls::GroupRoster` keeps the newest roster snapshot by transaction
+  (`CallAction::GroupUpdate` while ringing, `CallEvent::GroupUpdated` once up),
+  and one member's `<reject>` never ends the call. The worker files roster ids
+  under canonical chat ids and drops our own entry (`canonical_call`), and the
+  call's entry goes in the group under the member who rang. The library
+  reports no per-person speaking level or mute, so the tiles show neither.
+  Group video frames name their sender (`VideoFrame::sender`):
+  `decode_remote` keeps a decoder per sender (`MAX_REMOTE_STREAMS`, the oldest
+  let go), converts at tile size, and `VideoTick::RemoteFrom` reaches the
+  window as `Event::CallVideo { from }` under the member's chat id;
+  `Participant::video` follows their first frame, their own video state and
+  the roster. We have a tile of our own in the grid (`App::call_self`): our
+  camera, else our photo, with a muted sign when we are muted, and
+  `request_peer_keyframe` does nothing in a group call. A call link
+  (`safety::call_link`, `/voice/`, `/audio/` or `/video/`) clicked in a message
+  is joined with `voip().call_link(token, ..)` on a task of its own, since the
+  waiting room may hold it indefinitely; its answer returns as
+  `CallRuntimeEvent::LinkJoined`, and hanging up aborts it. Such a call has an
+  empty chat and `GroupCall::link`, and its local entry is filed under
+  `model::CALL_LINK_CHAT`, an id no chat has: it reaches the Calls page
+  (`Event::CallLog`) and nothing else, and its row there opens nothing. The library has no
+  way to join a group's ongoing call uninvited, so there is no Join banner.
+  Linked devices cannot start group calls (the server answers 427), so a group
+  has no call button, and a group's voice call cannot gain video. Call
+  updates are withheld during privacy recovery like other private content,
+  and a locked chat's call shows only "Locked chat" until its folder opens.
+  Calls open the system default devices; the call screen's pickers apply to
+  the running call only and are not saved. Video: `src/camera.rs` reads
+  cameras through linuxvideo on Linux (pure Rust, no build-time bindings) and
+  nokhwa on macOS and Windows, converts every layout to YUV 4:2:0, and the
+  call's capture thread encodes it with openh264 (Constrained Baseline, 720p
+  at most, 20 fps) into the library's timed `VideoSource`. `src/video_rate.rs`
+  adapts the bitrate (from 700 kbit/s) and the step of size and frame rate
+  (480p15, 540p20, 720p20) to the peer's RTCP loss, its REMB, and dropped
+  video; the camera is thinned to every nth frame of its measured rate and
+  stamped from capture time, never thinned by elapsed time; the peer's access
+  units decode on a thread of their own and reach the window as
+  `Event::CallVideo` frames. A camera that cannot open leaves a video call
+  receive-only rather than refusing it. Call history is `Content::Call`
+  messages: the phone's own `callLogMessage`s and `CALL_MISSED_*` stubs, plus
+  local entries (ids prefixed `CALL_ENTRY_PREFIX`) for calls made here,
+  `MissedCall`, `CallLogSync` and `CallLogHistory`. A local entry is skipped
+  when the chat already has a call the same way within `CALL_ENTRY_WINDOW`,
+  and the phone's own message, filed later, retires it
+  (`retire_local_call_twins`); local entries are never sent, read-receipted, reacted to or forwarded. The
+  Calls page reads `archive::call_log` per account.
 - Poll creation, voting, and decryption use whatsapp-rust's `Client::polls()`.
   `backend/worker/polls.rs` retains the original creator identity and key in the
   encrypted archive; `archive/polls.rs` keeps each voter's latest timestamp and
@@ -182,13 +281,25 @@ protocol. These notes are for coding agents and new contributors.
   with the same `mp4` and `openh264` pieces: a thread decodes from the
   keyframe before the start (openh264 must not flush after each packet or
   B-frames stop it) and streams scaled frames with presentation times; the
-  interface thread shows the due frame in one texture. rodio's symphonia
-  decodes the AAC track and its position steers the clock. Unsupported formats
-  go to the system player. Playback reads a downloaded local file; the shared
-  64 MiB attachment download limit applies to automatic and manual downloads,
-  not to the video decoder. `Action::PlayVideo/SeekVideo/ToggleVideoSound` drive
+  interface thread shows the due frame in one texture. `mp4` reads the AAC
+  track too, symphonia's AAC decoder decodes it, and rodio plays it; its
+  position steers the clock. rodio's own MP4 reader (symphonia 0.5's isomp4)
+  is not used for it: it refuses WhatsApp's videos, whose `esds` carries a
+  custom SLConfigDescriptor (#265). Unsupported formats
+  go to the system player. Playback reads a downloaded local file; the 64 MiB
+  attachment limit applies only to automatic downloads (`manual: false` on
+  `Action::Download`/`Command::Download`), never to a click or a play, and
+  not to the video decoder. Every download's deadline grows with its size
+  (`attachment_deadline`). `Action::PlayVideo/SeekVideo/ToggleVideoSound` drive
   it; leaving the chat stops it and an unseen video pauses. Round video
   messages (PTV) are `Content::Video { note: true }` and draw as circles.
+  `Action::CycleVideoSpeed` (the chip, or S full-window) runs the `Clock` at
+  1x, 1.5x or 2x; above 1x the sound is queued through `timestretch::Stream`,
+  the voice messages' pitch-keeping stretch run as the sound plays. It holds
+  only the frames its next search can reach, never the rest of the track,
+  searches on the channels' average and copies every channel, so stereo stays
+  stereo. A second heard covers `factor` seconds of video (`sound_position`),
+  so the sound keeps steering the clock at any speed.
 - Message bodies paint through `markup::paint_selectable` and single lines
   through `widgets::selectable_rich_text`: both hand the galley to
   `egui::text_selection::LabelSelectionState` (which paints it) and only
@@ -229,11 +340,25 @@ protocol. These notes are for coding agents and new contributors.
   dialog. A rename lands only after WhatsApp accepts it, and bumps
   `subject_generation` so a metadata answer asked for earlier cannot restore
   the old subject. A refusal re-asks the metadata to relearn the rights.
+- Mentioning everyone uses the visible body token `@all` and bit 1 of
+  `ContextInfo.non_jid_mentions` (`src/mentions.rs`). Localized words
+  (`@todos` in Portuguese, and the one-word alias of each other language)
+  are composer triggers only; `encode_composer_mentions` rewrites them to
+  `@all` when `Chat::can_mention_everyone` allows it: the sender can post,
+  the member list is known, and the group has at most 32 people or the
+  sender is an admin. The stored mention id is `mention-all`, not a JID.
+  Forwards and quoted copies clear that bit so the destination is not
+  notified again. A plain `@all` without the bit stays ordinary text.
+  Live edit events replace content and mentions together; caption edits keep
+  downloaded media paths. Derived archive backfills skip edited rows because
+  their retained raw protobuf still contains the original body and mentions.
 - A download that answers 403/404/410 goes through
   `client.media_reupload().request(..)` (a server-error receipt; WhatsApp
   has the phone re-upload and answers with a fresh `direct_path`) and is
   fetched once more before the bubble reports "No longer on WhatsApp's
-  servers". Download failures never toast; they live in the bubble as
+  servers". A chat sticker only the picker asked for skips the re-upload
+  (#405): the picker fetches through `sticker_pace`, two at a time, and a
+  failed one is not asked again that session. Download failures never toast; they live in the bubble as
   "... · click to retry". Copied text is refined by
   `transcript::refine`: emoji placeholders map back through each row's
   `placements`.
@@ -294,13 +419,19 @@ protocol. These notes are for coding agents and new contributors.
   on sets `hide_intent`, the window is destroyed, and a headless loop keeps
   calling `App::background_frame` (the link, the archive, the tray) until
   the tray, a clicked notification, or another launch sets `wants_show`,
-  when a new window is made. The tray item is fastframe-tray (ksni on
-  Linux, tray-icon on Windows and macOS; on macOS made with the first window
-  and pumped by `fastframe_tray::idle` while none exists), and `src/macos.rs`
-  hands its menu events to `fastframe_tray::claim_menu_event` first.
-  Closing keeps ZapFast running, and a hidden start stays hidden, only while
-  `Tray::is_shown`: on Linux the item exists before a panel shows it (a
-  start at login beats the panel) and registers once one appears. A
+  when a new window is made. `Shell::run` marks its thread as the UI thread,
+  where `fastframe_file::write` panics in debug: settings and the roster go
+  through `App::files` (a `fastframe_file::Writer`) with `save_to`, flushed
+  in `App::shutdown` and before a suspend is acknowledged, and `StallWatch`
+  in `main` logs any update of 250 ms or more. The tray item is
+  fastframe-tray (ksni on Linux, tray-icon on Windows and macOS; on macOS
+  made with the first window and pumped by `fastframe_tray::idle` while none
+  exists), and `src/macos.rs` hands its menu events to `fastframe_tray::claim_menu_event` first.
+  Closing keeps ZapFast running only while `Tray::is_shown`: on Linux the
+  item exists before a panel shows it (a start at login beats the panel, and
+  GNOME's tray watcher) and registers once one appears. A hidden start with
+  an item no panel shows yet waits `TRAY_WAIT` (30 s) for one in
+  `App::check_tray_wait`, then shows the window (#429). A
   hidden start makes the macOS item with `Tray::create_item`, which does not
   bring ZapFast forward; a window's `attach` makes it otherwise.
   `src/single_instance.rs` claims fastframe-instance's slot in the runtime
@@ -314,9 +445,28 @@ protocol. These notes are for coding agents and new contributors.
   reader is away from that chat; a click carries the chat and the message
   id, so the reader lands on the announced message. macOS has no title bar:
   the content runs to the top. `src/macos.rs` keeps native application menus alive across window
-  recreation; `fastframe_macos::align_traffic_lights` centres the traffic
+  recreation; `fastframe_titlebar::align_traffic_lights` centres the traffic
   lights on the chat header. Linking retains
   `ui::titlebar_strip`; other headers reserve horizontal space for the buttons.
+  On Windows and Linux, Settings > Appearance > Custom title bar
+  (`settings.custom_titlebar`, off by default for Intel drivers that
+  mis-draw a frameless window, Spotifast #348/#554) draws fastframe-titlebar's
+  caption buttons instead: `main` calls `init` and `set_enabled` before the
+  first window, `native_options` sets `with_decorations(!enabled())`, and
+  `SetCustomTitlebar` replaces the window through `Closed::Reopen`.
+  `ui::window_chrome` draws the buttons last each frame and keeps their areas
+  on top, then `resize`. `theme::chrome_in_headers` is true for macOS and the
+  drawn bar alike (banners go under the chat header); `theme::caption_footprint`
+  is the drawn buttons' room (`traffic_light_inset` includes its left end,
+  so the rail starts under left-hand GNOME buttons; `rail::lights_overhang`
+  stays macOS-only, and headers beside the rail measure their own room),
+  and `ui::caption_room(ctx, rect, min_content)` gives any header reaching
+  a top corner its room beside the buttons or under them
+  (`Footprint::reserve`). Every pane's top drags the window
+  (`ui::caption_drag` where macOS has no drag). Mica is unaffected: the crate
+  leaves the frame alone. Layout tests preview the room per context with
+  `theme::preview_titlebar`, never `set_enabled`, which is process-wide;
+  `--demo-titlebar` makes the choice for real in the demo.
 - Group delivery uses `archive::receipts`: save the recipients when filing an
   outgoing message, record each person's receipt, then take the least advanced
   recipient. Never promote a group from one reader, apply a receipt to earlier
@@ -522,3 +672,31 @@ mise or mbx.
   shell on the machine.
 - Delete one-off QA, packaging, and release-validation directories (under
   `.cache/` or `~/.cache/`) once their result is recorded.
+
+<!-- github-automation: pull-requests -->
+## Pull requests
+
+This section is maintained account-wide by
+[crmne/github-automation](https://github.com/crmne/github-automation) and is
+replaced when that policy changes. Do not edit it here. If it does not fit this
+repository, say so in a review or issue, and put repository-specific rules in a
+separate section, which takes precedence.
+
+Review evidence stays out of the repository. Before-and-after screenshots,
+captures, comparison pages, recordings, and anything else made to show
+reviewers a change go in the pull request description or its comments: attach
+the files there, or link a page published elsewhere. Only media the project
+itself uses, such as documentation figures, release-note images, and app
+assets, belongs in the repository.
+
+Dependencies come from their package registry, such as crates.io, RubyGems, or
+npm, or from repositories the maintainer controls, under `github.com/crmne/`
+or this repository's own organization. A git dependency, or a patch, override,
+or replace entry, may point only at such a repository, and adding or changing
+one needs the maintainer's explicit approval. Never point a dependency at a
+contributor's fork or any other source the maintainer does not control. When a
+dependency needs a fix, send it upstream and ask the maintainer to carry it in
+a fork they control until a release includes it.
+
+Reviewers treat either problem in a pull request as a blocker.
+<!-- /github-automation: pull-requests -->

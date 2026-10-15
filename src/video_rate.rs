@@ -1,0 +1,703 @@
+//! How much a call's camera sends, adapted to the path the call runs over.
+//!
+//! The encoder used to run at one fixed 1.5 Mbit/s, whatever the path between the two sides could
+//! carry. A path that carries less turns the surplus into loss and into access units the relay
+//! connection's send queue throws away, and every lost unit costs the peer's decoder its reference
+//! chain until the next keyframe arrives: the stutter a fixed rate produces on a real network.
+//!
+//! This starts below what a 720p picture needs, lowers the rate when the peer reports loss or the
+//! send queue drops video, raises it slowly while the peer reports a clean path, and moves the
+//! picture between three steps of size and frame rate as the rate crosses them. A step down is
+//! taken at once; a step up only once the rate has held for a while, because a new picture size
+//! starts with a keyframe and a keyframe is the most expensive thing to send.
+//!
+//! [`RateControl`] is plain state driven by the peer's reports, so it can be tested without a call;
+//! [`RateShare`] is what it publishes for the capture thread, which reads it between frames.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+/// One step of picture size and frame rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tier {
+    /// The picture's bounds, either way round: a portrait camera fits them turned upright.
+    pub long_side: usize,
+    pub short_side: usize,
+    pub fps: u32,
+    /// The most this step is sent at. A rate past it buys more from a larger picture than from a
+    /// sharper small one, so it is where the next step up begins.
+    pub max_bitrate: u32,
+    /// How the log names it.
+    pub name: &'static str,
+}
+
+/// The steps, smallest first. The top one is the budget a call's camera was always encoded within.
+pub const TIERS: [Tier; 3] = [
+    Tier {
+        long_side: 854,
+        short_side: 480,
+        fps: 15,
+        max_bitrate: 600_000,
+        name: "480p",
+    },
+    Tier {
+        long_side: 960,
+        short_side: 540,
+        fps: 20,
+        max_bitrate: 1_000_000,
+        name: "540p",
+    },
+    Tier {
+        long_side: 1280,
+        short_side: 720,
+        fps: 20,
+        max_bitrate: 1_500_000,
+        name: "720p",
+    },
+];
+
+/// Below this a picture is not worth sending at any size here.
+pub const MIN_BITRATE: u32 = 200_000;
+/// Where a call starts: enough for a clean 540p picture, well under what the path is assumed to
+/// carry until the peer's reports say otherwise.
+pub const START_BITRATE: u32 = 700_000;
+
+/// The rate at which the picture steps up from tier `n` to `n + 1`: the top of tier `n`.
+const STEP_UP: [u32; 2] = [TIERS[0].max_bitrate, TIERS[1].max_bitrate];
+/// The rate below which the picture steps down from tier `n + 1` to `n`. Lower than the step up,
+/// so a rate hovering at a boundary does not flip the picture size back and forth.
+const STEP_DOWN: [u32; 2] = [450_000, 850_000];
+/// How long a rate has to hold before the picture grows.
+const STEP_UP_HOLD: Duration = Duration::from_secs(4);
+/// After a sign of congestion, how long before the rate may rise again.
+const CONGESTION_HOLD: Duration = Duration::from_secs(3);
+/// The rise for a clean report, and how often it may be applied.
+const RISE: f64 = 1.08;
+const RISE_EVERY: Duration = Duration::from_secs(1);
+/// Reported loss above this is congestion; below `LOSS_CLEAN` the path is clean. Between the two
+/// the rate holds, since a few percent is what a healthy wireless link loses anyway.
+const LOSS_CONGESTED: f64 = 0.10;
+const LOSS_CLEAN: f64 = 0.02;
+/// What one round of send-queue drops costs the rate.
+const DROP_CUT: f64 = 0.7;
+/// How long a receiver estimate keeps capping the rate after the last one arrived.
+const REMB_TTL: Duration = Duration::from_secs(10);
+/// Our own audio streams the reports can name; a call has one, a renumbered one two.
+const AUDIO_SSRC_MEMORY: usize = 4;
+
+/// What the capture thread reads between frames: the rate and the step, as the controller last
+/// set them. And the one thing it reports back: frames it could not hand to the engine.
+#[derive(Debug)]
+pub struct RateShare {
+    bitrate: AtomicU32,
+    tier: AtomicUsize,
+    queue_drops: AtomicU32,
+}
+
+impl Default for RateShare {
+    fn default() -> Self {
+        let start = Setting::start();
+        Self {
+            bitrate: AtomicU32::new(start.bitrate),
+            tier: AtomicUsize::new(start.tier),
+            queue_drops: AtomicU32::new(0),
+        }
+    }
+}
+
+impl RateShare {
+    pub fn load(&self) -> Setting {
+        Setting {
+            bitrate: self.bitrate.load(Ordering::Relaxed),
+            tier: self.tier.load(Ordering::Relaxed).min(TIERS.len() - 1),
+        }
+    }
+
+    fn store(&self, setting: Setting) {
+        self.bitrate.store(setting.bitrate, Ordering::Relaxed);
+        self.tier.store(setting.tier, Ordering::Relaxed);
+    }
+
+    /// The capture thread found the queue to the engine full and dropped a frame.
+    pub fn note_queue_drop(&self) {
+        self.queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The frames dropped that way since the last time this was asked.
+    pub fn take_queue_drops(&self) -> u32 {
+        self.queue_drops.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// A rate and the step of picture it is sent at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Setting {
+    pub bitrate: u32,
+    /// Index into [`TIERS`].
+    pub tier: usize,
+}
+
+impl Setting {
+    fn start() -> Self {
+        Self {
+            bitrate: START_BITRATE,
+            tier: tier_for(START_BITRATE),
+        }
+    }
+
+    pub fn tier(self) -> Tier {
+        TIERS[self.tier]
+    }
+}
+
+/// The step a rate settles in when nothing else is known: the largest one it reaches.
+fn tier_for(bitrate: u32) -> usize {
+    STEP_UP.iter().filter(|step| bitrate >= **step).count()
+}
+
+/// Why the rate moved, for the log.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Reason {
+    /// The peer reported this fraction of our video lost.
+    Loss(f64),
+    /// The peer reported a clean path.
+    Clean,
+    /// The relay connection's send queue dropped video it could not take.
+    SendDrops,
+    /// The peer's own estimate of what it can receive.
+    Estimate(u32),
+}
+
+/// A move of the rate or the step, from one setting to the next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Change {
+    pub from: Setting,
+    pub to: Setting,
+    pub reason: Reason,
+}
+
+/// The adaptation, driven by the peer's RTCP and the send queue.
+#[derive(Debug)]
+pub struct RateControl {
+    setting: Setting,
+    /// When the rate first stood high enough for the next step up, while it still does.
+    above_since: Option<Instant>,
+    congested_at: Option<Instant>,
+    raised_at: Option<Instant>,
+    /// The peer's latest estimate of what it can receive, and when it said so.
+    estimate: Option<(u32, Instant)>,
+    /// Our own audio SSRCs, learnt from reports that cover audio alone, so that a report covering
+    /// both directions of media can be read for its video block alone.
+    audio_ssrcs: Vec<u32>,
+    share: Arc<RateShare>,
+}
+
+impl RateControl {
+    pub fn new(share: Arc<RateShare>) -> Self {
+        let setting = Setting::start();
+        share.store(setting);
+        Self {
+            setting,
+            above_since: None,
+            congested_at: None,
+            raised_at: None,
+            estimate: None,
+            audio_ssrcs: Vec::new(),
+            share,
+        }
+    }
+
+    pub fn setting(&self) -> Setting {
+        self.setting
+    }
+
+    /// One RTCP packet from the peer. `blocks` are its report blocks as `(ssrc, fraction lost)`,
+    /// `reports_audio` and `reports_video` whether it names our audio and our video stream, and
+    /// `estimates` any receiver bandwidth estimates (REMB) it carried.
+    pub fn on_rtcp(
+        &mut self,
+        reports_audio: bool,
+        reports_video: bool,
+        blocks: &[(u32, u8)],
+        estimates: &[u32],
+        now: Instant,
+    ) -> Option<Change> {
+        let mut change = None;
+        for &estimate in estimates {
+            change = self.on_estimate(estimate, now).or(change);
+        }
+        if reports_audio && !reports_video {
+            for &(ssrc, _) in blocks {
+                if !self.audio_ssrcs.contains(&ssrc) {
+                    if self.audio_ssrcs.len() == AUDIO_SSRC_MEMORY {
+                        self.audio_ssrcs.remove(0);
+                    }
+                    self.audio_ssrcs.push(ssrc);
+                }
+            }
+            return change;
+        }
+        if !reports_video || blocks.is_empty() {
+            return change;
+        }
+        // The blocks that can be about our video: all of them, less the ones known to be audio.
+        // Read conservatively when that leaves nothing to tell them apart by: the worst of them.
+        let video = blocks
+            .iter()
+            .filter(|(ssrc, _)| !self.audio_ssrcs.contains(ssrc))
+            .map(|&(_, lost)| lost)
+            .max();
+        let lost = video.or_else(|| blocks.iter().map(|&(_, lost)| lost).max())?;
+        self.on_loss(lost, now).or(change)
+    }
+
+    /// The fraction of our video the peer lost since its last report, in RTCP's 1/256 units.
+    pub fn on_loss(&mut self, fraction_lost: u8, now: Instant) -> Option<Change> {
+        let loss = f64::from(fraction_lost) / 256.0;
+        let before = self.setting;
+        let reason = if loss > LOSS_CONGESTED {
+            self.congested_at = Some(now);
+            self.setting.bitrate = scale(self.setting.bitrate, 1.0 - loss / 2.0);
+            Reason::Loss(loss)
+        } else if loss < LOSS_CLEAN && self.may_rise(now) {
+            self.raised_at = Some(now);
+            self.setting.bitrate = scale(self.setting.bitrate, RISE);
+            Reason::Clean
+        } else {
+            return self.restep(now, before, Reason::Loss(loss));
+        };
+        self.restep(now, before, reason)
+    }
+
+    /// The send queue dropped video it could not take: the path is carrying less than is sent.
+    pub fn on_send_drops(&mut self, now: Instant) -> Option<Change> {
+        let before = self.setting;
+        self.congested_at = Some(now);
+        self.setting.bitrate = scale(self.setting.bitrate, DROP_CUT);
+        self.restep(now, before, Reason::SendDrops)
+    }
+
+    /// The peer's own estimate of what it can receive caps the rate while it is fresh.
+    pub fn on_estimate(&mut self, bitrate: u32, now: Instant) -> Option<Change> {
+        let before = self.setting;
+        self.estimate = Some((bitrate, now));
+        self.restep(now, before, Reason::Estimate(bitrate))
+    }
+
+    fn may_rise(&self, now: Instant) -> bool {
+        self.congested_at
+            .is_none_or(|at| now.duration_since(at) >= CONGESTION_HOLD)
+            && self
+                .raised_at
+                .is_none_or(|at| now.duration_since(at) >= RISE_EVERY)
+    }
+
+    /// Keeps the rate between the floor and what it may be right now: the step's ceiling, and the
+    /// peer's estimate while that is fresh.
+    fn clamp(&mut self, now: Instant) {
+        let mut ceiling = self.setting.tier().max_bitrate;
+        if let Some((estimate, at)) = self.estimate
+            && now.duration_since(at) < REMB_TTL
+        {
+            ceiling = ceiling.min(estimate);
+        }
+        self.setting.bitrate = self
+            .setting
+            .bitrate
+            .clamp(MIN_BITRATE, ceiling.max(MIN_BITRATE));
+    }
+
+    /// Clamps the rate, settles the step for it, and publishes what changed.
+    ///
+    /// Clamped before the step is chosen, so a cap from the peer's estimate moves the picture as
+    /// well as the rate; and again after, against the ceiling of the step it settled in.
+    fn restep(&mut self, now: Instant, before: Setting, reason: Reason) -> Option<Change> {
+        self.clamp(now);
+        while self.setting.tier > 0 && self.setting.bitrate < STEP_DOWN[self.setting.tier - 1] {
+            self.setting.tier -= 1;
+            self.above_since = None;
+        }
+        // The rate cannot pass the ceiling of its step, which is exactly where the next one starts,
+        // so reaching the ceiling is what "high enough" means.
+        if self.setting.tier + 1 < TIERS.len() && self.setting.bitrate >= STEP_UP[self.setting.tier]
+        {
+            let since = *self.above_since.get_or_insert(now);
+            if now.duration_since(since) >= STEP_UP_HOLD {
+                self.setting.tier += 1;
+                self.above_since = None;
+            }
+        } else {
+            self.above_since = None;
+        }
+        self.clamp(now);
+        if self.setting == before {
+            return None;
+        }
+        self.share.store(self.setting);
+        Some(Change {
+            from: before,
+            to: self.setting,
+            reason,
+        })
+    }
+}
+
+fn scale(bitrate: u32, factor: f64) -> u32 {
+    (f64::from(bitrate) * factor)
+        .round()
+        .clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+/// A receiver estimate (RTCP PSFB "REMB", `draft-alvestrand-rmcat-remb`) from one feedback item's
+/// FCI, in bits per second.
+pub fn remb_bitrate(fci: &[u8]) -> Option<u32> {
+    if fci.get(..4)? != b"REMB" {
+        return None;
+    }
+    let exponent = u32::from(*fci.get(5)? >> 2);
+    let mantissa =
+        (u64::from(fci[5] & 0x03) << 16) | (u64::from(*fci.get(6)?) << 8) | u64::from(*fci.get(7)?);
+    Some(u32::try_from(mantissa << exponent.min(40)).unwrap_or(u32::MAX))
+}
+
+/// How many camera frames to let go for each one sent, so the frames that are sent are evenly
+/// spaced: every `n`th frame of a steady camera is a steady stream.
+///
+/// Thinning by elapsed time instead sends a 50 fps camera at a mix of 40 and 60 ms intervals for a
+/// 20 fps target, and that uneven spacing is what judders. The factor that lands nearest the
+/// target wins, with ties going to the lower rate, so a 50 fps camera sends 16.7 frames a second
+/// and a 60 fps one exactly 20.
+pub fn decimation(camera_fps: u32, target_fps: u32) -> u32 {
+    let camera = camera_fps.max(1);
+    let target = f64::from(target_fps.max(1));
+    (1..=camera)
+        .min_by(|a, b| {
+            let distance = |n: &u32| (f64::from(camera) / f64::from(*n) - target).abs();
+            distance(a)
+                .partial_cmp(&distance(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.cmp(a))
+        })
+        .unwrap_or(1)
+}
+
+/// The camera's real frame rate, measured over its last thirty frames.
+///
+/// A driver reports the rate it was set to, and a camera does not always keep to it: many slow
+/// down in a dim room, and a capture card runs at whatever its HDMI source does. Thinning by a
+/// rate the camera is not keeping sends far fewer frames than intended, so the rate is measured,
+/// and a move of more than a sixth from what the thinning was planned for is reported once.
+#[derive(Debug)]
+pub struct Cadence {
+    recent: std::collections::VecDeque<Instant>,
+    basis: f64,
+}
+
+/// Frames over which the rate is measured: thirty intervals.
+const CADENCE_WINDOW: usize = 31;
+/// How far the measured rate may drift from the planned one before the plan changes.
+const CADENCE_DRIFT: f64 = 1.0 / 6.0;
+
+impl Cadence {
+    pub fn new(planned_fps: f64) -> Self {
+        Self {
+            recent: std::collections::VecDeque::with_capacity(CADENCE_WINDOW),
+            basis: planned_fps.max(1.0),
+        }
+    }
+
+    /// One frame from the camera, taken at `at`. Returns the measured rate when it has moved far
+    /// enough from the one planned for to plan again, which then becomes the new basis.
+    pub fn observe(&mut self, at: Instant) -> Option<f64> {
+        if self.recent.len() == CADENCE_WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(at);
+        if self.recent.len() < CADENCE_WINDOW {
+            return None;
+        }
+        let span = self
+            .recent
+            .back()?
+            .saturating_duration_since(*self.recent.front()?)
+            .as_secs_f64();
+        if span <= 0.0 {
+            return None;
+        }
+        let measured = (CADENCE_WINDOW - 1) as f64 / span;
+        if (measured - self.basis).abs() / self.basis <= CADENCE_DRIFT {
+            return None;
+        }
+        self.basis = measured;
+        self.recent.clear();
+        Some(measured)
+    }
+}
+
+/// Turns capture instants into evenly spaced RTP timestamps.
+///
+/// A frame's time comes from when the camera handed it over, not from when its encode finished, so
+/// a keyframe that takes longer to encode is not stamped late. It is then snapped to the nominal
+/// spacing of the frames being sent: driver jitter of a millisecond or two would otherwise reach
+/// the peer as uneven playout. A frame the camera dropped still leaves its gap in the timeline.
+#[derive(Debug)]
+pub struct FrameClock {
+    started: Instant,
+    /// Microseconds between two sent frames.
+    period_us: f64,
+    last: Option<u64>,
+}
+
+impl FrameClock {
+    pub fn new(started: Instant, sent_fps: f64) -> Self {
+        Self {
+            started,
+            period_us: 1_000_000.0 / sent_fps.max(1.0),
+            last: None,
+        }
+    }
+
+    /// A new spacing from here on, keeping the timeline continuous.
+    pub fn respace(&mut self, sent_fps: f64) {
+        let last_us = self.last.map(|slot| slot as f64 * self.period_us);
+        self.period_us = 1_000_000.0 / sent_fps.max(1.0);
+        self.last = last_us.map(|us| (us / self.period_us).floor() as u64);
+    }
+
+    /// The 90 kHz timestamp for a frame captured at `captured`. Strictly increasing.
+    pub fn stamp(&mut self, captured: Instant) -> u32 {
+        let elapsed = captured.saturating_duration_since(self.started).as_micros() as f64;
+        let mut slot = (elapsed / self.period_us).round() as u64;
+        if let Some(last) = self.last
+            && slot <= last
+        {
+            slot = last + 1;
+        }
+        self.last = Some(slot);
+        let micros = slot as f64 * self.period_us;
+        ((micros * 90.0 / 1000.0).round() as u64 & u64::from(u32::MAX)) as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control() -> (RateControl, Arc<RateShare>) {
+        let share = Arc::new(RateShare::default());
+        (RateControl::new(Arc::clone(&share)), share)
+    }
+
+    #[test]
+    fn a_call_starts_at_a_540p_picture_well_under_what_720p_needs() {
+        let (control, share) = control();
+        assert_eq!(control.setting().bitrate, START_BITRATE);
+        assert_eq!(control.setting().tier().name, "540p");
+        assert_eq!(
+            share.load(),
+            control.setting(),
+            "the capture thread sees the same"
+        );
+    }
+
+    #[test]
+    fn loss_lowers_the_rate_and_a_lot_of_it_drops_the_picture_to_480p_at_15_fps() {
+        let (mut control, share) = control();
+        let now = Instant::now();
+        // A quarter of the video lost: the rate comes down by an eighth.
+        let change = control.on_loss(64, now).expect("a change");
+        assert!(matches!(change.reason, Reason::Loss(_)));
+        assert_eq!(change.to.bitrate, 612_500);
+        // Far more of it, and the picture steps down at once.
+        control.on_loss(200, now + Duration::from_millis(500));
+        let setting = control.setting();
+        assert!(setting.bitrate < 450_000, "{setting:?}");
+        assert_eq!(setting.tier().name, "480p");
+        assert_eq!(setting.tier().fps, 15);
+        assert_eq!(share.load(), setting);
+        // And never below the floor.
+        for step in 0..30 {
+            control.on_loss(255, now + Duration::from_secs(1 + step));
+        }
+        assert_eq!(control.setting().bitrate, MIN_BITRATE);
+    }
+
+    #[test]
+    fn a_few_percent_holds_the_rate_and_a_clean_path_raises_it_slowly() {
+        let (mut control, _) = control();
+        let now = Instant::now();
+        assert_eq!(control.on_loss(12, now), None, "5% is held, not acted on");
+        let change = control
+            .on_loss(0, now)
+            .expect("a clean report raises the rate");
+        assert_eq!(change.reason, Reason::Clean);
+        assert_eq!(change.to.bitrate, 756_000);
+        assert_eq!(
+            control.on_loss(0, now + Duration::from_millis(300)),
+            None,
+            "at most once a second"
+        );
+    }
+
+    #[test]
+    fn congestion_holds_off_the_next_rise() {
+        let (mut control, _) = control();
+        let now = Instant::now();
+        control.on_send_drops(now);
+        assert_eq!(control.setting().bitrate, 490_000);
+        assert_eq!(control.on_loss(0, now + Duration::from_secs(2)), None);
+        assert!(control.on_loss(0, now + Duration::from_secs(3)).is_some());
+    }
+
+    #[test]
+    fn the_picture_grows_only_once_the_rate_has_held() {
+        let (mut control, share) = control();
+        let start = Instant::now();
+        let mut now = start;
+        // Clean reports every second climb the rate to the top of 540p...
+        while control.setting().bitrate < TIERS[1].max_bitrate {
+            now += Duration::from_secs(1);
+            control.on_loss(0, now);
+        }
+        assert_eq!(control.setting().tier().name, "540p", "not yet");
+        // ...and only four seconds there later does the picture grow to 720p.
+        for _ in 0..4 {
+            now += Duration::from_secs(1);
+            control.on_loss(0, now);
+        }
+        assert_eq!(control.setting().tier().name, "720p");
+        assert_eq!(share.load().tier, 2);
+        // Then the rate keeps climbing to 720p's ceiling and no further.
+        for _ in 0..20 {
+            now += Duration::from_secs(1);
+            control.on_loss(0, now);
+        }
+        assert_eq!(control.setting().bitrate, TIERS[2].max_bitrate);
+    }
+
+    #[test]
+    fn the_peers_estimate_caps_the_rate_while_it_is_fresh() {
+        let (mut control, _) = control();
+        let now = Instant::now();
+        let change = control.on_estimate(400_000, now).expect("a cap");
+        assert_eq!(change.to.bitrate, 400_000);
+        assert_eq!(change.to.tier().name, "480p");
+        assert_eq!(
+            control.on_loss(0, now + Duration::from_secs(1)),
+            None,
+            "capped"
+        );
+        // An estimate that has gone quiet stops holding the rate down.
+        assert!(control.on_loss(0, now + Duration::from_secs(11)).is_some());
+    }
+
+    #[test]
+    fn a_report_is_read_for_our_video_block() {
+        let (mut control, _) = control();
+        let now = Instant::now();
+        // A report about our audio alone teaches which SSRC is audio.
+        assert_eq!(control.on_rtcp(true, false, &[(7, 200)], &[], now), None);
+        // A report about both is read for the other block: clean video, lossy audio, so it rises.
+        let change = control
+            .on_rtcp(true, true, &[(7, 200), (9, 0)], &[], now)
+            .expect("the video block is clean");
+        assert_eq!(change.reason, Reason::Clean);
+        // A report about video alone is read whole.
+        let change = control
+            .on_rtcp(false, true, &[(9, 128)], &[], now + Duration::from_secs(1))
+            .expect("half the video lost");
+        assert!(matches!(change.reason, Reason::Loss(_)));
+        // One that names neither of our streams is not ours to act on.
+        assert_eq!(
+            control.on_rtcp(false, false, &[(5, 255)], &[], now + Duration::from_secs(2)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_remb_is_read_from_its_mantissa_and_exponent() {
+        // 2^4 * 0x30D4 (12500) = 200000 bits a second.
+        let fci = [b'R', b'E', b'M', b'B', 1, (4 << 2), 0x30, 0xD4, 0, 0, 0, 9];
+        assert_eq!(remb_bitrate(&fci), Some(200_000));
+        assert_eq!(remb_bitrate(b"NOPE\x01\x00\x00\x01"), None);
+        assert_eq!(remb_bitrate(b"REMB"), None);
+    }
+
+    #[test]
+    fn the_frames_sent_are_every_nth_the_camera_gives() {
+        assert_eq!(decimation(50, 20), 3, "50 fps sends a steady 16.7");
+        assert_eq!(decimation(60, 20), 3);
+        assert_eq!(decimation(30, 20), 2, "15 is nearer 20 than 30 is");
+        assert_eq!(decimation(40, 16), 3, "13.3 is nearer 16 than 20 is");
+        assert_eq!(decimation(30, 15), 2);
+        assert_eq!(decimation(25, 20), 1);
+        assert_eq!(decimation(20, 20), 1);
+        assert_eq!(
+            decimation(15, 20),
+            1,
+            "a slow camera is sent at what it gives"
+        );
+        assert_eq!(decimation(0, 20), 1);
+    }
+
+    #[test]
+    fn capture_jitter_does_not_reach_the_timestamps() {
+        let start = Instant::now();
+        // 50 fps camera, every third frame sent: 60 ms apart, captured with a few ms of jitter.
+        let mut clock = FrameClock::new(start, 50.0 / 3.0);
+        let captured = [0u64, 62, 118, 181, 239];
+        let stamps: Vec<u32> = captured
+            .iter()
+            .map(|ms| clock.stamp(start + Duration::from_millis(*ms)))
+            .collect();
+        assert_eq!(stamps, [0, 5400, 10800, 16200, 21600]);
+        // A frame the camera dropped leaves its gap rather than being closed up.
+        assert_eq!(clock.stamp(start + Duration::from_millis(361)), 32_400);
+        // Two frames that round to the same slot still move forward.
+        let again = clock.stamp(start + Duration::from_millis(362));
+        assert!(again > 32_400);
+    }
+
+    #[test]
+    fn a_camera_keeping_its_rate_is_left_alone_and_one_that_slows_down_is_replanned() {
+        let start = Instant::now();
+        let mut steady = Cadence::new(50.0);
+        for frame in 0..100u64 {
+            assert_eq!(
+                steady.observe(start + Duration::from_millis(frame * 20)),
+                None
+            );
+        }
+        // Said to run at 30, really running at 15: noticed once a window of frames is in.
+        let mut dim = Cadence::new(30.0);
+        let measured = (0..31u64)
+            .find_map(|frame| dim.observe(start + Duration::from_micros(frame * 66_667)))
+            .expect("the slowdown is noticed");
+        assert!((measured - 15.0).abs() < 0.1, "{measured}");
+        // And not reported again while it stays there.
+        assert!((31..120u64).all(|frame| {
+            dim.observe(start + Duration::from_micros(frame * 66_667))
+                .is_none()
+        }));
+    }
+
+    #[test]
+    fn frames_the_capture_thread_dropped_are_handed_over_once() {
+        let share = RateShare::default();
+        share.note_queue_drop();
+        share.note_queue_drop();
+        assert_eq!(share.take_queue_drops(), 2);
+        assert_eq!(share.take_queue_drops(), 0);
+    }
+
+    #[test]
+    fn a_new_frame_rate_keeps_the_timeline_continuous() {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(start, 20.0);
+        assert_eq!(clock.stamp(start + Duration::from_millis(1000)), 90_000);
+        clock.respace(15.0);
+        let next = clock.stamp(start + Duration::from_millis(1066));
+        assert_eq!(next, 96_000);
+    }
+}

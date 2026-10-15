@@ -63,6 +63,32 @@ pub fn group_invite_code(value: &str) -> Option<String> {
     .then(|| code.to_owned())
 }
 
+/// A WhatsApp call link such as `https://call.whatsapp.com/voice/AbCd123`:
+/// its token, and whether it is a video call's (`/video/`) rather than a
+/// voice call's (`/voice/`, or `/audio/` as whatsapp-rust writes it).
+/// ZapFast joins these itself.
+pub fn call_link(value: &str) -> Option<(String, bool)> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.host_str()?.eq_ignore_ascii_case("call.whatsapp.com")
+    {
+        return None;
+    }
+    let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+    let video = match segments.next()? {
+        "voice" | "audio" => false,
+        "video" => true,
+        _ => return None,
+    };
+    let token = segments.next()?;
+    (segments.next().is_none()
+        && (8..=64).contains(&token.len())
+        && token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+    .then(|| (token.to_owned(), video))
+}
+
 /// Only common document/media formats go to their desktop application.
 /// Unknown files, scripts, installers and application bundles can be revealed
 /// in their folder instead. Sender-provided MIME types cannot grant permission.
@@ -113,6 +139,36 @@ pub fn can_open_attachment(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_links_are_recognised_and_nothing_else() {
+        let token = "AbCdEf1234567890";
+        assert_eq!(
+            call_link(&format!("https://call.whatsapp.com/voice/{token}")),
+            Some((token.to_owned(), false))
+        );
+        assert_eq!(
+            call_link(&format!("https://call.whatsapp.com/audio/{token}?utm=1")),
+            Some((token.to_owned(), false))
+        );
+        assert_eq!(
+            call_link(&format!("https://CALL.whatsapp.com/video/{token}/")),
+            Some((token.to_owned(), true))
+        );
+        for link in [
+            "https://call.whatsapp.com/",
+            "https://call.whatsapp.com/voice/",
+            "https://call.whatsapp.com/voice/short",
+            "https://call.whatsapp.com/screen/AbCdEf1234567890",
+            "https://call.whatsapp.com.evil.example/voice/AbCdEf1234567890",
+            "https://call.whatsapp.com/voice/AbCdEf1234567890/extra",
+            "https://call.whatsapp.com/voice/AbCd%20Ef1234567890",
+            "https://chat.whatsapp.com/AbCdEf1234567890",
+            "whatsapp://call.whatsapp.com/voice/AbCdEf1234567890",
+        ] {
+            assert_eq!(call_link(link), None, "{link}");
+        }
+    }
 
     #[test]
     fn group_invite_links_are_recognised_and_nothing_else() {

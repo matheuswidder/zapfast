@@ -126,6 +126,7 @@
                 perl
                 makeWrapper
               ]
+              ++ lib.optionals isLinux [ removeReferencesTo ]
               # Sandboxed stand-ins for iconutil and codesign in bundle.sh.
               ++ lib.optionals isDarwin [
                 icnsify
@@ -142,9 +143,17 @@
             );
             ZAPFAST_TEST_RTL_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
 
+            # The vendored OpenSSL (through rusqlite's bundled SQLCipher) embeds
+            # its build line, compiler path included, in the binary. The app
+            # never runs it, but the text alone would keep the whole compiler
+            # (about 280 MiB) in the runtime closure. Fail the build if a
+            # reference survives.
+            disallowedReferences = pkgs.lib.optionals isLinux [ pkgs.stdenv.cc ];
+
             postFixup =
               # The GUI dlopens its Wayland, X11 and GL libraries at run time.
               pkgs.lib.optionalString isLinux ''
+                find $out/bin -type f -exec remove-references-to -t ${pkgs.stdenv.cc} {} +
                 wrapProgram $out/bin/zapfast \
                   --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs}
               ''

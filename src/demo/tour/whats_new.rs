@@ -22,6 +22,11 @@ pub(super) const NOTE: &str = "tour-note";
 /// labels, stickers, and two videos in Grace Hopper's chat.
 pub fn prepare(app: &mut App) {
     super::common_setup(app);
+    // The tour opens Rust Berlin at its newest messages, not at the sample's
+    // unread mention.
+    for chat in &mut app.chats {
+        chat.unread_mention = None;
+    }
     app.settings.interface_language = Some(crate::i18n::Locale::English);
     app.locale = crate::i18n::Locale::English;
     super::show_photos(

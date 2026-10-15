@@ -41,11 +41,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          # The oldest supported Ubuntu: the binary needs the glibc it was
+          # built against or newer (2.35), so the packages install on
+          # Ubuntu 22.04 and Debian 12 as well as newer releases.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           # A native arm64 runner, so the GUI's system libraries need no
           # cross-compilation sysroot.
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -113,13 +116,44 @@ jobs:
             "/DOutputDir=$PWD\dist" packaging\windows\zapfast.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The Windows Installer package, which replaces the setup program
+      # above once every install has updated through one release carrying
+      # both.
+      - uses: ruby/setup-ruby@v1
+        if: runner.os == 'Windows'
+        with:
+          ruby-version: '4.0'
+      - name: Windows Installer package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          gem install native-packages --version 0.9.0 --no-document
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:Path += ";$env:USERPROFILE\.dotnet\tools"
+          $target = "${{ matrix.target }}"
+          $payload = "dist\windows-input-$target"
+          New-Item -ItemType Directory -Force $payload | Out-Null
+          Copy-Item "target\$target\release\zapfast.exe", README.md, LICENSE, THIRD-PARTY-NOTICES.md, `
+            packaging\windows\zapfast-installer.txt $payload
+          $packageTarget = if ($target.StartsWith("aarch64")) { "windows-arm64" } else { "windows-amd64" }
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          native-packages build --version $version --target $packageTarget `
+            --defer-recipes --output "$env:RUNNER_TEMP\windows-packages"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item "$env:RUNNER_TEMP\windows-packages\packages\$packageTarget\msi\*.msi" dist\
+          Remove-Item -Recurse $payload
+
       - name: Attest release packages
-        uses: crmne/native-packages/.github/actions/attest@999768410cf53cdc68c8679c09cb14de1a6bca7b # v0.8.1
+        uses: crmne/native-packages/.github/actions/attest@83bd46c245488c2b8f1b9d74569e16cf6a449e8f # v0.9.0
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
             dist/*-setup.exe
+            dist/*.msi
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
@@ -127,6 +161,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*-setup.exe
+            dist/*.msi
           if-no-files-found: error
 
   macos:
@@ -173,7 +208,7 @@ jobs:
         with:
           ruby-version: '4.0'
       - name: Install native packaging
-        run: gem install native-packages --version 0.8.1 --no-document
+        run: gem install native-packages --version 0.9.0 --no-document
 
       - name: App bundle
         run: |
@@ -193,7 +228,7 @@ jobs:
         run: bash packaging/macos/verify.sh "dist/zapfast-${GITHUB_REF_NAME}-macos-universal.dmg"
 
       - name: Attest macOS package
-        uses: crmne/native-packages/.github/actions/attest@999768410cf53cdc68c8679c09cb14de1a6bca7b # v0.8.1
+        uses: crmne/native-packages/.github/actions/attest@83bd46c245488c2b8f1b9d74569e16cf6a449e8f # v0.9.0
         with:
           subject-path: dist/*.dmg
       - uses: actions/upload-artifact@v7
@@ -233,7 +268,7 @@ jobs:
           cache: false
           upload-artifact: false
       - name: Attest Flatpak bundle
-        uses: crmne/native-packages/.github/actions/attest@999768410cf53cdc68c8679c09cb14de1a6bca7b # v0.8.1
+        uses: crmne/native-packages/.github/actions/attest@83bd46c245488c2b8f1b9d74569e16cf6a449e8f # v0.9.0
         with:
           subject-path: "*.flatpak"
       - uses: actions/upload-artifact@v7
@@ -261,7 +296,7 @@ jobs:
         with:
           ruby-version: '4.0'
       - name: Sign update manifest
-        uses: crmne/native-packages/.github/actions/sign-release@999768410cf53cdc68c8679c09cb14de1a6bca7b # v0.8.1
+        uses: crmne/native-packages/.github/actions/sign-release@83bd46c245488c2b8f1b9d74569e16cf6a449e8f # v0.9.0
         with:
           directory: dist
           public-key: assets/update-public-key.hex

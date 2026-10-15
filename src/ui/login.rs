@@ -108,10 +108,25 @@ fn body(app: &mut App, ui: &mut egui::Ui) {
             );
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if theme::pill_button(ui, &palette, "Try again", true).clicked() {
+                if theme::pill_button(
+                    ui,
+                    &palette,
+                    &crate::i18n::gettext(app.locale, "Try again"),
+                    true,
+                )
+                .clicked()
+                {
                     app.actions.push(Action::Reconnect);
                 }
-                if key_lost && theme::pill_button(ui, &palette, "Start over…", false).clicked() {
+                if key_lost
+                    && theme::pill_button(
+                        ui,
+                        &palette,
+                        &crate::i18n::gettext(app.locale, "Start over…"),
+                        false,
+                    )
+                    .clicked()
+                {
                     app.actions
                         .push(Action::ShowDialog(crate::model::Dialog::ConfirmStartOver));
                 }
