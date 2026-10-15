@@ -2708,6 +2708,15 @@ msgstr "Copiar transcrição"
 msgid "GPU acceleration"
 msgstr "Aceleração por GPU"
 
+msgid "GPU runtime"
+msgstr "Runtime de GPU"
+
+msgid "Runs the model on an NVIDIA graphics card through whisper.cpp. Everything stays on this computer."
+msgstr "Roda o modelo numa placa NVIDIA pelo whisper.cpp. Tudo fica neste computador."
+
+msgid "The GPU runtime is installed."
+msgstr "O runtime de GPU está instalado."
+
 msgid "NVIDIA cards, about 1.2 GB. Other computers stay on the CPU."
 msgstr "Placas NVIDIA, cerca de 1,2 GB. Nos outros computadores continua na CPU."
 

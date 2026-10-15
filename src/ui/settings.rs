@@ -950,6 +950,38 @@ fn sections(app: &App) -> Vec<Section> {
             ],
             transcription_models,
         );
+        extensions.row(
+            translated(locale, "GPU acceleration"),
+            translated(
+                locale,
+                "NVIDIA cards, about 1.2 GB. Other computers stay on the CPU.",
+            ),
+            move |ui, app| {
+                let palette = app.palette;
+                let mut value = app.settings.transcription_gpu;
+                let response = widgets::switch(ui, &palette, &mut value);
+                theme::reveal_focus(&response);
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Checkbox,
+                        ui.is_enabled(),
+                        value,
+                        "GPU acceleration",
+                    )
+                });
+                if response.changed() {
+                    app.actions.push(Action::SetTranscriptionGpu(value));
+                }
+            },
+        );
+        extensions.block(
+            vec![
+                translated(locale, "GPU runtime"),
+                "whisper.cpp CUDA".into(),
+                translated(locale, "Install"),
+            ],
+            transcription_gpu_runtime,
+        );
     }
 
     let mut about_section = Section::new(translated(locale, "About"));
@@ -1152,6 +1184,107 @@ fn transcription_models(ui: &mut egui::Ui, app: &mut App) {
                 );
             }
             ui.add_space(2.0);
+        }
+    });
+}
+
+/// The NVIDIA CUDA runtime of whisper.cpp: install, progress, and removal.
+fn transcription_gpu_runtime(ui: &mut egui::Ui, app: &mut App) {
+    use crate::i18n::gettext;
+    use crate::transcription::{DownloadState, GPU_PACKAGE_KEY, GPU_PACKAGE_SIZE};
+    let palette = app.palette;
+    let locale = app.locale;
+    let installed = crate::transcription::gpu_ready(&app.dirs);
+    let progress = app.transcriber.download_status(GPU_PACKAGE_KEY);
+    ui.vertical(|ui| {
+        ui.label(
+            gettext(
+                locale,
+                "Runs the model on an NVIDIA graphics card through whisper.cpp. Everything stays on this computer.",
+            )
+            .as_ref(),
+        );
+        ui.add_space(6.0);
+        let row = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let dot = if installed {
+                    palette.accent
+                } else {
+                    palette.secondary.gamma_multiply(0.6)
+                };
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.0, dot);
+                ui.label("whisper-cli");
+                theme::text(
+                    ui,
+                    format!("{GPU_PACKAGE_SIZE} · CUDA 12.4"),
+                    theme::regular(11.5),
+                    palette.secondary,
+                );
+                if let Some(DownloadState::Downloading { received, total }) = &progress {
+                    let fraction = total
+                        .filter(|total| *total > 0)
+                        .map(|total| *received as f32 / total as f32)
+                        .unwrap_or(0.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_height(14.0)
+                            .desired_width(120.0)
+                            .text(format!("{:.0}%", fraction * 100.0))
+                            .corner_radius(7.0),
+                    );
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if matches!(&progress, Some(DownloadState::Downloading { .. })) {
+                        if theme::soft_button(
+                            ui,
+                            &palette,
+                            Some(Icon::X),
+                            &gettext(locale, "Cancel"),
+                            false,
+                        )
+                        .clicked()
+                        {
+                            app.actions.push(Action::CancelTranscriptionGpuDownload);
+                        }
+                    } else if installed {
+                        if theme::icon_button(
+                            ui,
+                            Icon::Trash,
+                            14.0,
+                            palette.secondary,
+                            palette.danger,
+                            &gettext(locale, "Delete model"),
+                        )
+                        .clicked()
+                        {
+                            app.actions.push(Action::DeleteTranscriptionGpu);
+                        }
+                    } else if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Download),
+                        &gettext(locale, "Install"),
+                        false,
+                    )
+                    .clicked()
+                    {
+                        app.actions.push(Action::DownloadTranscriptionGpu);
+                    }
+                });
+            })
+            .response;
+        if installed {
+            row.on_hover_text(gettext(locale, "The GPU runtime is installed.").as_ref());
+        }
+        if let Some(DownloadState::Failed(error)) = &progress {
+            theme::text(
+                ui,
+                format!("{}: {error}", gettext(locale, "Download failed")),
+                theme::regular(11.5),
+                palette.danger,
+            );
         }
     });
 }

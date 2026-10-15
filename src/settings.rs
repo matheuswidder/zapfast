@@ -589,6 +589,9 @@ pub struct Settings {
     /// Transcribe in Portuguese instead of letting the model detect the
     /// language.
     pub transcription_portuguese: bool,
+    /// Hand clips to the NVIDIA CUDA build of whisper.cpp instead of the
+    /// in-process CPU model.
+    pub transcription_gpu: bool,
     /// Which chats have their voice messages transcribed on their own.
     pub transcription_auto: TranscriptionAuto,
     /// Chats transcribed on their own when the scope is specific chats.
@@ -653,6 +656,7 @@ impl Default for Settings {
             transcription_enabled: false,
             transcription_model: None,
             transcription_portuguese: true,
+            transcription_gpu: false,
             transcription_auto: TranscriptionAuto::Off,
             transcription_chats: Vec::new(),
         }

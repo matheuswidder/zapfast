@@ -80,6 +80,92 @@ pub const MODELS: [Model; 5] = [
     },
 ];
 
+/// The NVIDIA CUDA build of whisper.cpp, for GPU transcription. Windows only:
+/// the package carries `whisper-cli.exe` and the NVIDIA runtime DLLs it needs.
+pub const GPU_PACKAGE_KEY: &str = "gpu";
+pub const GPU_PACKAGE_URL: &str = "https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-win-cuda-12.4.0-x64.zip";
+pub const GPU_PACKAGE_SIZE: &str = "1.2 GB";
+
+/// Where the GPU runtime lives, next to the models in the state directory.
+pub fn gpu_dir(dirs: &crate::paths::AppDirs) -> PathBuf {
+    dirs.state.join("whisper-cuda")
+}
+
+/// The zip the download lands in before it is unpacked.
+fn gpu_zip_path(dir: &Path) -> PathBuf {
+    dir.join("whisper-cuda.zip")
+}
+
+/// Finds `whisper-cli.exe` under `dir`, wherever the zip's top folder put it.
+fn find_cli(dir: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name == "whisper-cli.exe")
+            {
+                return Some(path);
+            }
+            if path.is_dir()
+                && let Some(found) = walk(&path)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(dir)
+}
+
+/// The GPU runtime is installed and the extension can hand clips to it.
+pub fn gpu_ready(dirs: &crate::paths::AppDirs) -> bool {
+    find_cli(&gpu_dir(dirs)).is_some()
+}
+
+/// The `whisper-cli.exe` of an installed runtime, wherever the zip's top
+/// folder put it. Falls back to the conventional path when nothing is there.
+pub fn cli_path(dirs: &crate::paths::AppDirs) -> PathBuf {
+    let dir = gpu_dir(dirs);
+    find_cli(&dir).unwrap_or_else(|| dir.join("whisper-cli.exe"))
+}
+
+/// Removes the GPU runtime, the partial zip of a cancelled download included.
+pub fn delete_gpu(dirs: &crate::paths::AppDirs) -> std::io::Result<()> {
+    let dir = gpu_dir(dirs);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
+}
+
+/// Unpacks the downloaded zip into `dir`, reporting the files as they land.
+fn extract_gpu_package(zip_path: &Path, dir: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path).map_err(|error| error.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        // A zip entry's name can carry `..`; confine every file to `dir`.
+        let name = entry
+            .enclosed_name()
+            .ok_or_else(|| "unsafe path in package".to_owned())?;
+        let out = dir.join(name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|error| error.to_string())?;
+        } else {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let mut file = std::fs::File::create(&out).map_err(|error| error.to_string())?;
+            std::io::copy(&mut entry, &mut file).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// The model a settings key names.
 pub fn model_by_key(key: &str) -> Option<&'static Model> {
     MODELS.iter().find(|model| model.key == key)
@@ -123,6 +209,9 @@ struct Job {
     model: PathBuf,
     /// BCP-47 hint for the model, `None` lets it detect the language.
     language: Option<String>,
+    /// `whisper-cli.exe` of an installed CUDA runtime. When set, the clip is
+    /// handed to it instead of the in-process CPU model.
+    gpu: Option<PathBuf>,
 }
 
 /// Shared handle the interface and the worker see: transcript states, model
@@ -162,7 +251,10 @@ impl Transcriber {
                         .insert(job.message.clone(), TranscribeState::Running);
                     worker_revision.fetch_add(1, Ordering::Relaxed);
                     waker.wake();
-                    let result = transcribe(&job, &mut loaded);
+                    let result = match &job.gpu {
+                        Some(cli) if cli.is_file() => transcribe_external(&job, cli),
+                        _ => transcribe(&job, &mut loaded),
+                    };
                     let mut states = worker_states.lock().unwrap_or_else(|p| p.into_inner());
                     states.insert(
                         job.message,
@@ -225,6 +317,7 @@ impl Transcriber {
         path: PathBuf,
         model: PathBuf,
         language: Option<String>,
+        gpu: Option<PathBuf>,
     ) {
         let mut states = self.states.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(
@@ -240,6 +333,7 @@ impl Transcriber {
             path,
             model,
             language,
+            gpu,
         };
         self.queue
             .lock()
@@ -328,6 +422,75 @@ impl Transcriber {
         if matches!(downloads.get(key), Some(DownloadState::Downloading { .. })) {
             downloads.insert(key.to_owned(), DownloadState::Cancelled);
         }
+    }
+
+    /// Starts the CUDA runtime's download in its own thread, then unpacks the
+    /// zip. An existing download or an installed runtime is left alone.
+    pub fn download_gpu(&self, dirs: crate::paths::AppDirs, waker: Waker) {
+        {
+            let mut downloads = self.downloads.lock().unwrap_or_else(|p| p.into_inner());
+            match downloads.get(GPU_PACKAGE_KEY) {
+                Some(DownloadState::Downloading { .. }) | Some(DownloadState::Done) => return,
+                _ => {}
+            }
+            downloads.insert(
+                GPU_PACKAGE_KEY.to_owned(),
+                DownloadState::Downloading {
+                    received: 0,
+                    total: None,
+                },
+            );
+        }
+        let downloads = Arc::clone(&self.downloads);
+        let revision = Arc::clone(&self.revision);
+        let settled = Arc::clone(&self.settled);
+        std::thread::Builder::new()
+            .name("gpu-download".to_owned())
+            .spawn(move || {
+                let dir = gpu_dir(&dirs);
+                let zip = gpu_zip_path(&dir);
+                let mut state = if gpu_ready(&dirs) {
+                    DownloadState::Done
+                } else {
+                    let _ = std::fs::create_dir_all(&dir);
+                    // The zip is fetched with the same progress reporting as a
+                    // model, then unpacked and removed.
+                    let mut state =
+                        fetch_url(GPU_PACKAGE_URL, &zip, GPU_PACKAGE_KEY, &downloads, &waker);
+                    if matches!(state, DownloadState::Done) {
+                        state = match extract_gpu_package(&zip, &dir) {
+                            Ok(()) if find_cli(&dir).is_some() => DownloadState::Done,
+                            Ok(()) => DownloadState::Failed(
+                                "the package has no whisper-cli.exe".to_owned(),
+                            ),
+                            Err(error) => DownloadState::Failed(error),
+                        };
+                        let _ = std::fs::remove_file(&zip);
+                    }
+                    state
+                };
+                if matches!(state, DownloadState::Cancelled) {
+                    state = DownloadState::Failed("cancelled".to_owned());
+                }
+                {
+                    let mut downloads = downloads.lock().unwrap_or_else(|p| p.into_inner());
+                    downloads.insert(GPU_PACKAGE_KEY.to_owned(), state);
+                }
+                settled.fetch_add(1, Ordering::Relaxed);
+                revision.fetch_add(1, Ordering::Relaxed);
+                waker.wake();
+            })
+            .expect("spawns the GPU download thread");
+    }
+
+    /// Removes an installed CUDA runtime and forgets its progress row.
+    pub fn remove_gpu(&self, dirs: &crate::paths::AppDirs) {
+        self.downloads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(GPU_PACKAGE_KEY);
+        let _ = delete_gpu(dirs);
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -446,6 +609,102 @@ fn fetch_url(
         return DownloadState::Failed(error.to_string());
     }
     DownloadState::Done
+}
+
+/// Hands the clip to `whisper-cli.exe`, the CUDA build. The CLI only reads
+/// WAV, MP3 and FLAC, not the OGG a voice note arrives as, so the clip is
+/// decoded and resampled here and handed over as a temporary 16 kHz WAV.
+fn transcribe_external(job: &Job, cli: &Path) -> Result<String, String> {
+    use std::process::Stdio;
+    let bytes = std::fs::read(&job.path).map_err(|error| error.to_string())?;
+    let (at_rate, rate) = if bytes.starts_with(b"OggS") {
+        (voice::decode(&bytes)?, voice::RATE)
+    } else {
+        decode_other(&bytes)?
+    };
+    let samples = resample(&at_rate, rate, WHISPER_RATE);
+    if samples.is_empty() {
+        return Err("empty clip".to_owned());
+    }
+    let wav = std::env::temp_dir().join(format!(
+        "zapfast-transcribe-{}-{}.wav",
+        job.message.replace(['/', '\\', ':'], "_"),
+        crate::util::now()
+    ));
+    write_wav(&wav, &samples).map_err(|error| error.to_string())?;
+    let text = (|| {
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "--model".into(),
+            job.model.clone().into_os_string(),
+            "--no-prints".into(),
+        ];
+        if let Some(language) = &job.language {
+            args.push("--language".into());
+            args.push(language.into());
+        }
+        args.push(wav.clone().into_os_string());
+        // CREATE_NO_WINDOW keeps a console from flashing per message.
+        #[cfg(windows)]
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = std::process::Command::new(cli);
+        command
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("whisper-cli: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "whisper-cli exited with {}",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        // The CLI prints processing marks such as `[BLANK_AUDIO]`; those are
+        // not part of the words.
+        let text: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('['))
+            .map(|line| line.to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(text.trim().to_owned())
+    })();
+    let _ = std::fs::remove_file(&wav);
+    text
+}
+
+/// Writes mono f32 samples as a 16-bit PCM WAV at `WHISPER_RATE`.
+fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
+    let data: Vec<u8> = samples
+        .iter()
+        .flat_map(|sample| {
+            let clamped = sample.clamp(-1.0, 1.0);
+            ((clamped * 32_767.0).round() as i16).to_le_bytes()
+        })
+        .collect();
+    let byte_length = (data.len() as u32).to_le_bytes();
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(b"RIFF")?;
+    file.write_all(&(36_u32 + data.len() as u32).to_le_bytes())?;
+    file.write_all(b"WAVEfmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?; // PCM
+    file.write_all(&1u16.to_le_bytes())?; // mono
+    file.write_all(&WHISPER_RATE.to_le_bytes())?;
+    file.write_all(&(WHISPER_RATE * 2).to_le_bytes())?; // byte rate
+    file.write_all(&2u16.to_le_bytes())?; // block align
+    file.write_all(&16u16.to_le_bytes())?; // bits per sample
+    file.write_all(b"data")?;
+    file.write_all(&byte_length)?;
+    file.write_all(&data)
 }
 
 /// Decodes the clip and runs the model. `loaded` keeps one context alive
@@ -633,7 +892,7 @@ mod tests {
         let transcriber = Transcriber::new(crate::backend::Waker::default());
         let missing = std::env::temp_dir().join("zapfast-transcription-absent.bin");
         let _ = std::fs::remove_file(&missing);
-        transcriber.enqueue("m1".to_owned(), missing.clone(), missing, None);
+        transcriber.enqueue("m1".to_owned(), missing.clone(), missing, None, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match transcriber.status("m1") {
@@ -659,6 +918,7 @@ mod tests {
             "m1".to_owned(),
             std::env::temp_dir().join("absent.bin"),
             std::env::temp_dir().join("absent.ggml"),
+            None,
             None,
         );
         assert!(transcriber.status("m1").is_some());
@@ -699,5 +959,31 @@ mod tests {
     #[test]
     fn a_non_ogg_rejects_cleanly() {
         assert!(decode_other(b"nope").is_err());
+    }
+
+    /// The WAV handed to whisper-cli declares itself as 16 kHz mono PCM and
+    /// carries one little-endian sample per input frame.
+    #[test]
+    fn the_wav_for_the_cli_is_pcm_mono_at_whispers_rate() {
+        let dir = std::env::temp_dir().join("zapfast-transcription-wav-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clip.wav");
+        write_wav(&path, &[0.0, 0.5, -1.0, 1.0]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..16], b"WAVEfmt ");
+        let channels = u16::from_le_bytes([bytes[22], bytes[23]]);
+        let rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        assert_eq!((channels, rate), (1, WHISPER_RATE));
+        assert_eq!(&bytes[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
+            8
+        );
+        // Full scale maps to i16's bounds, not one past them.
+        assert_eq!(&bytes[44..46], &[0, 0]);
+        assert_eq!(&bytes[46..48], &[0, 64]); // 0.5 -> 16384
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

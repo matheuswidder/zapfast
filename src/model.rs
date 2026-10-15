@@ -2411,6 +2411,14 @@ pub enum Action {
     DeleteTranscriptionModel(&'static str),
     /// Picks Portuguese or automatic language detection for the model.
     SetTranscriptionPortuguese(bool),
+    /// Runs transcription on the NVIDIA CUDA build of whisper.cpp.
+    SetTranscriptionGpu(bool),
+    /// Starts the CUDA runtime's download and unpacking.
+    DownloadTranscriptionGpu,
+    /// Stops the CUDA runtime's download.
+    CancelTranscriptionGpuDownload,
+    /// Removes the installed CUDA runtime.
+    DeleteTranscriptionGpu,
     /// Sets which chats have their voice messages transcribed on their own.
     SetTranscriptionAuto(crate::settings::TranscriptionAuto),
     /// Adds or removes one chat from the chosen-chat list.

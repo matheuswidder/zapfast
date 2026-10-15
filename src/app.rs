@@ -7175,6 +7175,33 @@ impl App {
                 self.settings.transcription_portuguese = on;
                 self.mark_settings_dirty();
             }
+            Action::SetTranscriptionGpu(on) => {
+                self.settings.transcription_gpu = on;
+                // Transcripts on screen came from whichever engine was live;
+                // switching engines deserves fresh words.
+                self.transcriber.forget_all();
+                self.mark_settings_dirty();
+            }
+            Action::DownloadTranscriptionGpu => {
+                self.transcriber
+                    .download_gpu(self.dirs.clone(), self.waker.clone());
+            }
+            Action::CancelTranscriptionGpuDownload => {
+                self.transcriber
+                    .cancel_download(crate::transcription::GPU_PACKAGE_KEY);
+            }
+            Action::DeleteTranscriptionGpu => {
+                if let Err(error) = crate::transcription::delete_gpu(&self.dirs) {
+                    self.toast_error(error.to_string());
+                } else {
+                    self.transcriber.remove_gpu(&self.dirs);
+                    if self.settings.transcription_gpu {
+                        self.settings.transcription_gpu = false;
+                        self.transcriber.forget_all();
+                        self.mark_settings_dirty();
+                    }
+                }
+            }
             Action::SetTranscriptionAuto(scope) => {
                 self.settings.transcription_auto = scope;
                 self.mark_settings_dirty();
@@ -9057,6 +9084,8 @@ impl App {
         let dir = crate::transcription::models_dir(&self.dirs);
         // enqueue ignores a message already queued or running, and replaces
         // a finished or failed transcript with a fresh run.
+        let gpu = (self.settings.transcription_gpu && crate::transcription::gpu_ready(&self.dirs))
+            .then(|| crate::transcription::cli_path(&self.dirs));
         self.transcriber.enqueue(
             message,
             path,
@@ -9064,6 +9093,7 @@ impl App {
             self.settings
                 .transcription_portuguese
                 .then(|| "pt".to_owned()),
+            gpu,
         );
     }
 
