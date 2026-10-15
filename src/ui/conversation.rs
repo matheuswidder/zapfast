@@ -9536,7 +9536,8 @@ fn voice_player(
                 let time = footer_width(
                     ui,
                     message,
-                    view.starred.is_some_and(|stars| stars.contains(&message.id)),
+                    view.starred
+                        .is_some_and(|stars| stars.contains(&message.id)),
                     view.pins.is_some_and(|pins| pins.contains(&message.id)),
                 ) + 10.0;
                 let (row, _) = ui.allocate_exact_size(vec2(width.max(0.0), 22.0), Sense::hover());
@@ -10695,6 +10696,8 @@ mod tests {
             copy_rows: Some(app.copy_rows.as_ref()),
             selecting: false,
             motion_playing: None,
+            transcriber: &app.transcriber,
+            transcription_ready: false,
             starred: None,
             pins: None,
             pin_notices: &[],
