@@ -2319,19 +2319,43 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
             });
             if source == crate::settings::TtsSource::Remote {
                 ui.add_space(6.0);
-                egui::TextEdit::singleline(&mut app.settings.tts_endpoint)
-                    .id(egui::Id::new("tts-endpoint"))
-                    .desired_width(f32::INFINITY)
-                    .hint_text(
-                        egui::RichText::new(
-                            crate::i18n::gettext(locale, "Service address").into_owned(),
+                ui.horizontal(|ui| {
+                    let endpoint_width = (ui.available_width() * 0.60).max(120.0);
+                    let resp = egui::TextEdit::singleline(&mut app.settings.tts_endpoint)
+                        .id(egui::Id::new("tts-endpoint"))
+                        .desired_width(endpoint_width)
+                        .hint_text(
+                            egui::RichText::new(
+                                crate::i18n::gettext(locale, "Service address").into_owned(),
+                            )
+                            .color(palette.dim)
+                            .font(theme::regular(BODY_SIZE)),
                         )
-                        .color(palette.dim)
-                        .font(theme::regular(BODY_SIZE)),
-                    )
-                    .font(theme::regular(BODY_SIZE))
-                    .text_color(palette.text)
-                    .show(ui);
+                        .font(theme::regular(BODY_SIZE))
+                        .text_color(palette.text)
+                        .show(ui);
+                    if resp.response.changed() {
+                        app.actions
+                            .push(Action::SetTtsEndpoint(app.settings.tts_endpoint.clone()));
+                    }
+                    let token_resp = egui::TextEdit::singleline(&mut app.tts_token)
+                        .id(egui::Id::new("tts-token"))
+                        .desired_width(f32::INFINITY)
+                        .password(true)
+                        .hint_text(
+                            egui::RichText::new(
+                                crate::i18n::gettext(locale, "Service token").into_owned(),
+                            )
+                            .color(palette.dim)
+                            .font(theme::regular(BODY_SIZE)),
+                        )
+                        .font(theme::regular(BODY_SIZE))
+                        .text_color(palette.text)
+                        .show(ui);
+                    if token_resp.response.changed() {
+                        app.actions.push(Action::SetTtsKey(app.tts_token.clone()));
+                    }
+                });
                 let _ = endpoint;
             }
             ui.add_space(8.0);

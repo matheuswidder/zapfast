@@ -577,6 +577,9 @@ pub struct App {
     /// The TTS panel over the composer: the text being written, the chat it
     /// goes to, and the speech that was made of it.
     pub tts: Option<TtsDraft>,
+    /// Token for the remote speech service, kept in memory and mirrored to
+    /// the OS keyring.
+    pub tts_token: String,
     /// Counts the TTS requests, so each one gets a name of its own.
     next_tts_id: u64,
     /// In-chat video player.
@@ -1415,6 +1418,22 @@ impl App {
             settled_downloads: 0,
             synthesizer: crate::tts::Synthesizer::new(waker.clone()),
             tts: None,
+            tts_token: crate::secret::load(crate::tts::TTS_TOKEN)
+                .filter(|k| !k.trim().is_empty())
+                .or_else(|| {
+                    let home =
+                        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+                    let path = std::path::PathBuf::from(home).join(".config/9router/api-key.txt");
+                    let key = std::fs::read_to_string(path).ok()?;
+                    let trimmed = key.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        let _ = crate::secret::store(crate::tts::TTS_TOKEN, &trimmed);
+                        Some(trimmed)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
             next_tts_id: 0,
             video: crate::video::Player::new(waker.clone()),
             video_chat: None,
@@ -7323,8 +7342,11 @@ impl App {
                 self.mark_settings_dirty();
             }
             Action::SetTtsKey(key) => {
+                self.tts_token = key.clone();
                 // The token lives in the OS keyring, not in the settings file.
-                if let Err(error) = crate::secret::store(crate::tts::TTS_TOKEN, &key) {
+                if key.trim().is_empty() {
+                    let _ = crate::secret::forget(crate::tts::TTS_TOKEN);
+                } else if let Err(error) = crate::secret::store(crate::tts::TTS_TOKEN, &key) {
                     self.toast_error(error);
                 }
             }
@@ -9590,7 +9612,11 @@ impl App {
                     model: None,
                     endpoint: Some(self.settings.tts_endpoint.clone()),
                     voice: Some(voice.model.to_owned()),
-                    key: crate::secret::load(crate::tts::TTS_TOKEN),
+                    key: if !self.tts_token.trim().is_empty() {
+                        Some(self.tts_token.trim().to_owned())
+                    } else {
+                        crate::secret::load(crate::tts::TTS_TOKEN)
+                    },
                     output,
                 }
             }

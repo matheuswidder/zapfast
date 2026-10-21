@@ -1119,24 +1119,29 @@ fn sections(app: &App) -> Vec<Section> {
                 move |ui, app| {
                     use crate::i18n::gettext;
                     let palette = app.palette;
-                    let mut token = String::new();
-                    let response = egui::TextEdit::singleline(&mut token)
-                        .id(egui::Id::new("tts_token"))
-                        .desired_width(f32::INFINITY)
-                        .password(true)
-                        .text_color(palette.text)
-                        .hint_text(
-                            egui::RichText::new(
-                                gettext(locale, "The service's token").into_owned(),
+                    ui.horizontal(|ui| {
+                        let width = (220.0_f32 - 76.0).max(140.0).min(ui.available_width());
+                        let response = egui::TextEdit::singleline(&mut app.tts_token)
+                            .id(egui::Id::new("tts_token"))
+                            .desired_width(width)
+                            .password(true)
+                            .text_color(palette.text)
+                            .hint_text(
+                                egui::RichText::new(
+                                    gettext(locale, "The service's token").into_owned(),
+                                )
+                                .color(palette.dim),
                             )
-                            .color(palette.dim),
-                        )
-                        .show(ui);
-                    // The keyring is written once the field is left, not on
-                    // every keystroke.
-                    if response.response.changed() && response.response.lost_focus() {
-                        app.actions.push(Action::SetTtsKey(token));
-                    }
+                            .show(ui);
+                        if response.response.changed() {
+                            app.actions.push(Action::SetTtsKey(app.tts_token.clone()));
+                        }
+                        if theme::soft_button(ui, &palette, None, &gettext(locale, "Save"), false)
+                            .clicked()
+                        {
+                            app.actions.push(Action::SetTtsKey(app.tts_token.clone()));
+                        }
+                    });
                 },
             );
         }

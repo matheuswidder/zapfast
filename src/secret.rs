@@ -64,4 +64,17 @@ mod tests {
         // No keyring is opened by a test, so this must not panic.
         let _ = load("tts-token");
     }
+
+    #[test]
+    fn test_real_keyring_roundtrip() {
+        let test_user = "zapfast-test-token";
+        let res = store(test_user, "secret123");
+        println!("store result: {res:?}");
+        if res.is_ok() {
+            let loaded = load(test_user);
+            println!("loaded: {loaded:?}");
+            assert_eq!(loaded.as_deref(), Some("secret123"));
+            let _ = forget(test_user);
+        }
+    }
 }
