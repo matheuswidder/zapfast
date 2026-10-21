@@ -3467,6 +3467,31 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.transcriber
                     .seed("you-voice", crate::transcription::TranscribeState::Running);
             }
+            // The TTS extension over the composer: the text, and the speech
+            // that was made of it, waiting to be listened to and sent.
+            "speaking" => {
+                app.settings.tts_enabled = true;
+                app.settings.tts_source = crate::settings::TtsSource::Local;
+                let tone: Vec<f32> = (0..crate::voice::RATE * 4)
+                    .map(|i| {
+                        let t = i as f32 / crate::voice::RATE as f32;
+                        (t * 220.0 * std::f32::consts::TAU).sin() * 0.4
+                    })
+                    .collect();
+                let dir = app.dirs.cache.join("tts");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join("tts-demo.wav");
+                let _ = crate::transcription::write_wav_at(&path, &tone, crate::voice::RATE);
+                app.tts = Some(crate::app::TtsDraft {
+                    id: "tts-demo".to_owned(),
+                    chat: app.open_chat.clone().unwrap_or_default(),
+                    text: "Boa tarde. Esta e a mensagem que o radialista vai falar.".to_owned(),
+                    speech: Some(path),
+                    samples: Some(tone),
+                    error: None,
+                    working: false,
+                });
+            }
             // Shows the native image preview over the demo chat.
             "preview" => {
                 // Three photos with a text between the second and the third,
@@ -6225,6 +6250,7 @@ mod tests {
             "recording",
             "transcribed",
             "transcribe-failed",
+            "speaking",
             "preview",
             "gifs",
             "gifs-badkey",

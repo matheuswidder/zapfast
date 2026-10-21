@@ -1597,15 +1597,13 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 // The TTS button takes its place next to the microphone, so
                 // the field gives up the width of both.
                 let tts_width = if app.settings.tts_enabled && app.tts.is_none() {
-                    22.0 + crate::theme::ICON_BUTTON_PAD
+                    22.0 + crate::theme::ICON_BUTTON_PAD + ui.spacing().item_spacing.x
                 } else {
                     0.0
                 };
-                let field_width = (ui.available_width()
-                    - button_width
-                    - tts_width
-                    - ui.spacing().item_spacing.x * 2.0)
-                    .max(0.0);
+                let field_width =
+                    (ui.available_width() - button_width - tts_width - ui.spacing().item_spacing.x)
+                        .max(0.0);
                 // The ink is centred on the controls, not the line box: the
                 // span from a capital's top to a descender's bottom sits as far
                 // from the field's top as from its bottom. Inter's box leaves
@@ -2369,12 +2367,11 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
     if send {
         app.actions.push(Action::SendTts { chat });
     }
-    if play {
-        if let Some(draft) = app.tts.as_ref()
-            && let Some(path) = draft.speech.clone()
-        {
-            let _ = app.player.toggle(&draft.id, &path);
-        }
+    if play
+        && let Some(draft) = app.tts.as_ref()
+        && let Some(path) = draft.speech.clone()
+    {
+        let _ = app.player.toggle(&draft.id, &path);
     }
 }
 

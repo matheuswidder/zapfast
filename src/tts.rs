@@ -220,7 +220,7 @@ pub fn piper_ready(dirs: &crate::paths::AppDirs) -> bool {
 
 /// The model of a voice is on disk, both the weights and their settings.
 pub fn voice_downloaded(voice: &LocalVoice, dir: &Path) -> bool {
-    dir.join(&voice.file).is_file() && dir.join(format!("{}.json", voice.file)).is_file()
+    dir.join(voice.file).is_file() && dir.join(voice.config_file()).is_file()
 }
 
 /// How a synthesis is going.
@@ -583,8 +583,7 @@ fn speak(request: &Request) -> Result<(Vec<f32>, PathBuf), String> {
         TtsSource::Local => speak_local(request)?,
         TtsSource::Remote => speak_remote(request)?,
     };
-    let (samples, rate) = crate::transcription::decode_other(&bytes)?;
-    let samples = crate::transcription::resample(&samples, rate, crate::voice::RATE);
+    let samples = crate::transcription::decode_for_voice_note(&bytes)?;
     if samples.is_empty() {
         return Err("the service returned no speech".to_owned());
     }
@@ -753,8 +752,12 @@ mod tests {
             let (decoded, decoded_rate) =
                 crate::transcription::decode_other(&bytes).expect("decodes the tone");
             assert_eq!(decoded_rate, rate);
-            let at_voice_rate =
-                crate::transcription::resample(&decoded, decoded_rate, crate::voice::RATE);
+            // The decoder brings the file to the voice note's own rate, so a
+            // second of speech is a second of samples whatever the file's
+            // rate was.
+            assert_eq!(decoded.len(), crate::voice::RATE as usize);
+            let at_voice_rate = crate::transcription::decode_for_voice_note(&bytes)
+                .expect("decodes the tone for the voice note");
             assert_eq!(at_voice_rate.len(), crate::voice::RATE as usize);
             let _ = std::fs::remove_file(&path);
         }
@@ -777,5 +780,43 @@ mod tests {
         assert_eq!(rate, crate::voice::RATE);
         assert_eq!(decoded.len(), samples.len());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// With Piper and a voice installed, the local source speaks the text
+    /// and leaves a file the player can read. On a machine without them
+    /// there is nothing to prove, and the test says so.
+    #[test]
+    fn the_local_source_speaks_the_text() {
+        let dirs = crate::paths::AppDirs::discover();
+        let Some(piper) = piper_path(&dirs) else {
+            return;
+        };
+        let voice = &LOCAL_VOICES[0];
+        let model = models_dir(&dirs).join(voice.file);
+        if !model.is_file() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("zapfast-tts-test");
+        std::fs::create_dir_all(&dir).expect("the test folder");
+        let output = dir.join("local.wav");
+        let request = Request {
+            id: "tts-local".to_owned(),
+            text: "Boa tarde. Este e um teste de sintese de fala local.".to_owned(),
+            source: TtsSource::Local,
+            piper: Some(piper),
+            model: Some(model),
+            endpoint: None,
+            voice: None,
+            key: None,
+            output: output.clone(),
+        };
+        let (samples, path) = speak(&request).expect("Piper speaks the text");
+        assert!(!samples.is_empty(), "the speech is not empty");
+        assert!(path.is_file(), "the speech file is there");
+        // The samples are at the rate a voice note uses, whatever rate
+        // Piper answered at.
+        let seconds = samples.len() as f32 / crate::voice::RATE as f32;
+        assert!(seconds > 0.5, "the speech lasts more than half a second");
+        let _ = std::fs::remove_file(&output);
     }
 }

@@ -15,6 +15,10 @@ O ZapFast acrescido de uma extensão de transcrição local de mensagens de voz,
 usando `whisper-rs` in-process, só CPU. O botão fica na bolha de áudio, o texto
 aparece dentro dela, e os clipes ficam só na memória da sessão.
 
+E uma extensão de TTS: o inverso. Um botão ao lado do microfone abre um
+painel, o texto digitado é falado, e só é enviado depois que você escuta e
+aceita. A fala vem de uma voz local (Piper) ou de um serviço.
+
 | | |
 | --- | --- |
 | Branch de trabalho | `transcription` |
@@ -212,6 +216,40 @@ sobre debug porque o `whisper-rs-sys` força `CMAKE_BUILD_TYPE=RelWithDebInfo`.
 ruins, e o bom não acompanha o áudio. Foi medido com voz sintética: teste com
 mensagens reais antes de concluir alguma coisa.
 
+## A extensão de TTS
+
+`src/tts.rs`. O texto vira uma mensagem de voz pela mesma porta da gravação:
+`Command::SendVoice`, com amostras mono a 48 kHz.
+
+**Duas fontes de fala.**
+
+A local roda o [Piper](https://github.com/rhasspy/piper) (MIT) nesta máquina,
+com uma voz baixada sob demanda. O binário e o modelo são downloads
+separados, como o runtime CUDA e os modelos Whisper. Medido aqui: 4,7 s de
+fala em 0,32 s de inferência, fator tempo-real 0,073. As vozes pt-BR do
+Piper são `faber`, `jeff`, `cadu` e `edresson`, todas em
+`huggingface.co/rhasspy/piper-voices`.
+
+A remota pergunta a um serviço. O endereço padrão é o do seu radialista,
+`https://proxy.widder.cloud/v1/audio/speech`, a API de áudio da OpenAI: o
+modelo é `edge-tts/<voz>` e o corpo é `{"model":…,"input":…}`. O token fica no
+cofre do sistema (`src/secret.rs`), nunca no `settings.json`.
+
+**As vozes do Edge que respondem** são só quatro, e isso não é escolha:
+perguntar por outra dá `Bing TTS failed: 500` no serviço e 502 no proxy.
+Testadas uma a uma em 21/10/2026 — `ThalitaMultilingual`, `Thalita`,
+`Francisca` e `Antonio` respondem; as `Multilingual` das outras e as antigas
+não.
+
+**O que o serviço devolve** é MP3 MPEG-2 Layer III a 16 kHz estéreo. O Piper
+devolve WAV a 22.05 kHz mono. Os dois viram amostras a 48 kHz antes de
+enviar, pelo `resample()` que a transcrição já usava.
+
+O arquivo de onde vem a fala é decodificado pelo `rodio::Decoder`, que já
+aceita MP3 e WAV — por isso a extensão não acrescenta nenhuma dependência
+nova de decodificação. `tar` e `flate2` entraram só para descompactar o
+pacote do Piper no Linux e no macOS.
+
 Modelos baixados em `C:\Users\teco_\zapfast-turbo-test\` (2,2 GB — pode apagar).
 
 ## Capturas
@@ -221,13 +259,15 @@ cargo run --features demo -- --demo --demo-page transcribed
 cargo run --features demo -- --demo --demo-shot "C:\Users\teco_\zapfast-shots\x.png" --demo-page transcribed,dark
 ```
 
-Cenários: `transcribed`, `transcribe-failed`. Combine com vírgula para
-acumular (`transcribed,select`). Capturas prontas em
+Cenários: `transcribed`, `transcribe-failed`, `speaking`. Combine com
+vírgula para acumular (`transcribed,select`). Capturas prontas em
 `C:\Users\teco_\zapfast-shots\rebase\`.
 
 O `--demo-shot` com tema precisa ser conferido depois de qualquer mudança de
 layout, porque foi olhando a imagem que apareceu um bug que 1114 testes não
-pegaram.
+pegaram. O painel do TTS (`speaking`) é um deles: o botão novo no compositor
+muda a largura do campo, e o teste `suggestion_lists_sit_close_above_the_composer`
+descobre se a conta está errada.
 
 ## Pendência conhecida
 

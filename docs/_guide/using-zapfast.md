@@ -441,6 +441,28 @@ never sent anywhere, and the transcript lasts for this session only.
 pinned chats, one-to-one chats, every chat including groups, or a list you
 choose. Messages that arrive before the first model finishes downloading are
 transcribed once it lands, as long as the chat is still in scope.
+
+## Speaking
+
+With **Settings > Extensions > Speak messages** on, a speaker button sits
+next to the microphone in the composer. Click it and a panel opens over the
+composer, with a field to type in. What you type is spoken, and the speech
+is played back in the panel: a play button, and beside it **Send**, **Say it
+again**, and a delete button.
+
+Nothing is sent until you press **Send**. Until then the text can be changed
+and said again as many times as you like, and the whole thing can be thrown
+away with the delete button or closed without sending. The message that goes
+out is a voice message of the chat the panel was opened in, exactly like a
+recording from the microphone.
+
+**Where the speech comes from**, in the same settings, picks between a voice
+that runs on this computer and a service that speaks the text over the
+network. The local one is [Piper](https://github.com/rhasspy/piper) with a
+Brazilian Portuguese voice, and the text never leaves the machine. The
+service one sends the text to the address you set, and answers with the
+audio.
+
 ## Calls
 
 The phone and camera buttons in a one-to-one chat's header start a voice or a

@@ -823,6 +823,15 @@ pub(crate) fn decode_other(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
     Ok((voice::mono_at_rate(&interleaved, channels, rate), rate))
 }
 
+/// Decodes any audio file into the mono samples a voice note carries. The
+/// decoder brings the file to the voice note's own rate, so the samples come
+/// out ready to be sent, and the rate it answers with is the file's and must
+/// not be used to resample them again.
+pub(crate) fn decode_for_voice_note(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    let (samples, _rate) = decode_other(bytes)?;
+    Ok(samples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1003,31 @@ mod tests {
     #[test]
     fn a_non_ogg_rejects_cleanly() {
         assert!(decode_other(b"nope").is_err());
+    }
+
+    /// The decoder brings the file to the voice note's own rate and answers
+    /// with the file's rate: the two are not the same. A caller that
+    /// resamples the samples again would stretch the audio, so the samples
+    /// come ready to use through [`decode_for_voice_note`].
+    #[test]
+    fn the_decoder_answers_with_the_files_own_rate() {
+        let dir = std::env::temp_dir().join("zapfast-transcription-decode-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tone.wav");
+        let samples: Vec<f32> = (0..16_000)
+            .map(|index| (index as f32 * 0.01).sin())
+            .collect();
+        write_wav_at(&path, &samples, 16_000).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (decoded, rate) = decode_other(&bytes).unwrap();
+        assert_eq!(rate, 16_000, "the file's own rate");
+        assert_eq!(
+            decoded.len(),
+            voice::RATE as usize,
+            "the samples are already at the voice note's rate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The WAV handed to whisper-cli declares itself as 16 kHz mono PCM and

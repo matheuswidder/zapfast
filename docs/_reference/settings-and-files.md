@@ -19,6 +19,8 @@ On Linux:
 | Per-number settings | `~/.local/state/zapfast/accounts/<id>/settings.json` | Notifications, receipts, typing, automatic downloads, background history, the last open chat, the chat-list chip or label, and the wallpaper |
 | Stickers and packs | `~/.local/state/zapfast/accounts/<id>/stickers/` | Plain WebP files; each pack is a folder |
 | Transcription models | `~/.local/state/zapfast/models/` | Whisper models, 141 MB to 3 GB each; removed by the trash button in Settings, never by clearing the cache |
+| Speech models | `~/.local/state/zapfast/tts/models/` | Piper voices, about 63 MB each; removed by the trash button in Settings |
+| Speech engine | `~/.local/state/zapfast/tts/piper/` | Piper, the engine the local voices run on; removed by the trash button in Settings |
 | Wallpaper image | `~/.local/state/zapfast/accounts/<id>/wallpaper.jpg` | Copy of the chosen picture (or `.png`, `.webp`, `.gif`) |
 | Attachments, avatars | `~/.cache/zapfast/accounts/<id>/` | Safe to delete; available files download again when viewed |
 | Last run's log | `~/.local/state/zapfast/zapfast.log` | `--verbose` for more |
@@ -293,6 +295,40 @@ archive, never synced, and are gone when ZapFast closes.
 GitHub for update checks and releases. The transcription extension adds
 nothing else: no message content, phone number, key, or QR payload is ever
 sent, and the model runs offline once downloaded.
+
+## Speech
+
+**Settings > Extensions > Speak messages** turns text into a voice message.
+A speaker button next to the microphone opens a panel over the composer: what
+is typed there is spoken, played back, and only sent when you accept it.
+Until then it can be edited and said again as many times as wanted, and
+thrown away for nothing. The message that goes out is a voice message of the
+chat the panel was opened in, exactly like a recording.
+
+**Where the speech comes from** picks between two sources.
+
+**On this computer** runs [Piper](https://github.com/rhasspy/piper) with a
+voice downloaded on demand. The text never leaves the machine, and the
+speech comes out in a fraction of the time it takes to say it. The engine and
+the voice are separate downloads: Piper itself, and one of the Brazilian
+Portuguese voices.
+
+| Voice | Size | Notes |
+| --- | --- | --- |
+| Faber | 63 MB | A male news anchor's voice |
+| Jeff | 63 MB | Male |
+| Cadu | 63 MB | Male |
+| Edresson | 63 MB | Male, lighter than the others |
+
+**A service** sends the text to a service that speaks it and answers with an
+audio file. The **Service address** is the URL to send it to, and the
+**Service token** is filed in the OS keyring rather than in the settings
+file. This is the only part of the extension that puts anything on the
+network, and it puts the text there, so choose a service you trust.
+
+**Network access.** The local source adds nothing: the text goes to Piper on
+this computer and the speech never leaves it. The remote source sends the
+text to the service at the address you set, and nothing else.
 
 ## App lock
 
