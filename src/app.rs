@@ -9559,7 +9559,7 @@ impl App {
         }
         let id = format!("tts-{}", self.next_tts_id);
         self.next_tts_id += 1;
-        let dir = self.dirs.cache.join("tts");
+        let dir = self.dirs.media_cache_dir().join("tts");
         if std::fs::create_dir_all(&dir).is_err() {
             self.toast_error("could not write the speech".to_owned());
             return;

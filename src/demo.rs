@@ -3478,7 +3478,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         (t * 220.0 * std::f32::consts::TAU).sin() * 0.4
                     })
                     .collect();
-                let dir = app.dirs.cache.join("tts");
+                let dir = app.dirs.media_cache_dir().join("tts");
                 let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join("tts-demo.wav");
                 let _ = crate::transcription::write_wav_at(&path, &tone, crate::voice::RATE);
