@@ -983,6 +983,145 @@ fn sections(app: &App) -> Vec<Section> {
             transcription_gpu_runtime,
         );
     }
+    extensions.toggle(
+        translated(locale, "Speak messages"),
+        translated(
+            locale,
+            "Turn text into a voice message. A local voice runs on this computer; a service speaks the text over the network.",
+        ),
+        |settings| &mut settings.tts_enabled,
+    );
+    if app.settings.tts_enabled {
+        extensions.row(
+            translated(locale, "Where the speech comes from"),
+            translated(
+                locale,
+                "On this computer the text never leaves it; a service sends it over the network.",
+            ),
+            move |ui, app| {
+                let palette = app.palette;
+                let selected = app.settings.tts_source;
+                let response = egui::ComboBox::from_id_salt("tts_source")
+                    .selected_text(selected.label(locale))
+                    .width(200.0_f32.min(ui.available_width()))
+                    .show_ui(ui, |ui| {
+                        for choice in crate::settings::TtsSource::ALL {
+                            if theme_option(
+                                ui,
+                                &palette,
+                                choice.label(locale).as_ref(),
+                                choice == selected,
+                            ) {
+                                app.actions.push(Action::SetTtsSource(choice));
+                            }
+                        }
+                    });
+                theme::reveal_focus(&response.response);
+            },
+        );
+        extensions.row(
+            translated(locale, "Voice"),
+            translated(locale, "The voice that speaks the text."),
+            move |ui, app| {
+                let palette = app.palette;
+                let source = app.settings.tts_source;
+                let voice = app.settings.tts_voice.clone();
+                let selected = match source {
+                    crate::settings::TtsSource::Local => crate::tts::local_voice_by_key(&voice)
+                        .map(|found| found.label)
+                        .unwrap_or(crate::tts::LOCAL_VOICES[0].label),
+                    crate::settings::TtsSource::Remote => crate::tts::remote_voice_by_name(&voice)
+                        .map(|found| found.label)
+                        .unwrap_or(crate::tts::REMOTE_VOICES[0].label),
+                };
+                let response = egui::ComboBox::from_id_salt("tts_voice")
+                    .selected_text(selected)
+                    .width(220.0_f32.min(ui.available_width()))
+                    .show_ui(ui, |ui| match source {
+                        crate::settings::TtsSource::Local => {
+                            for option in crate::tts::LOCAL_VOICES {
+                                if theme_option(ui, &palette, option.label, option.key == voice) {
+                                    app.actions.push(Action::SetTtsVoice(option.key.to_owned()));
+                                }
+                            }
+                        }
+                        crate::settings::TtsSource::Remote => {
+                            for option in crate::tts::REMOTE_VOICES {
+                                if theme_option(ui, &palette, option.label, option.name == voice) {
+                                    app.actions
+                                        .push(Action::SetTtsVoice(option.name.to_owned()));
+                                }
+                            }
+                        }
+                    });
+                theme::reveal_focus(&response.response);
+            },
+        );
+        if app.settings.tts_source == crate::settings::TtsSource::Local {
+            extensions.block(
+                vec![
+                    translated(locale, "Piper"),
+                    "speech".into(),
+                    translated(locale, "Install"),
+                ],
+                tts_piper_runtime,
+            );
+            extensions.block(
+                vec![
+                    translated(locale, "Voice model"),
+                    "Piper".into(),
+                    translated(locale, "Download"),
+                ],
+                tts_voice_models,
+            );
+        } else {
+            extensions.row(
+                translated(locale, "Service address"),
+                translated(locale, "Where the text is sent to be spoken."),
+                move |ui, app| {
+                    let palette = app.palette;
+                    let mut endpoint = app.settings.tts_endpoint.clone();
+                    let response = egui::TextEdit::singleline(&mut endpoint)
+                        .id(egui::Id::new("tts_endpoint"))
+                        .desired_width(f32::INFINITY)
+                        .text_color(palette.text)
+                        .show(ui);
+                    if response.response.changed() {
+                        app.actions.push(Action::SetTtsEndpoint(endpoint));
+                    }
+                },
+            );
+            extensions.row(
+                translated(locale, "Service token"),
+                translated(
+                    locale,
+                    "Kept in the OS keyring, never in the settings file.",
+                ),
+                move |ui, app| {
+                    use crate::i18n::gettext;
+                    let palette = app.palette;
+                    let mut token = String::new();
+                    let response = egui::TextEdit::singleline(&mut token)
+                        .id(egui::Id::new("tts_token"))
+                        .desired_width(f32::INFINITY)
+                        .password(true)
+                        .text_color(palette.text)
+                        .hint_text(
+                            egui::RichText::new(
+                                gettext(locale, "The service's token").into_owned(),
+                            )
+                            .color(palette.dim),
+                        )
+                        .show(ui);
+                    // The keyring is written once the field is left, not on
+                    // every keystroke.
+                    if response.response.changed() && response.response.lost_focus() {
+                        app.actions.push(Action::SetTtsKey(token));
+                    }
+                },
+            );
+        }
+    }
 
     let mut about_section = Section::new(translated(locale, "About"));
     about_section.block(
@@ -1059,6 +1198,211 @@ fn model_hint(
         "turbo" => gettext(locale, "The most accurate of these, and the slowest."),
         _ => "".into(),
     }
+}
+
+/// The local voices of the TTS extension: sizes, download buttons with
+/// progress, and which one the extension speaks with.
+fn tts_voice_models(ui: &mut egui::Ui, app: &mut App) {
+    use crate::i18n::gettext;
+    use crate::transcription::DownloadState;
+    let palette = app.palette;
+    let locale = app.locale;
+    let dir = crate::tts::models_dir(&app.dirs);
+    let active = app.settings.tts_voice.clone();
+    ui.vertical(|ui| {
+        ui.label(gettext(locale, "The local voices run on this computer.").as_ref());
+        ui.add_space(6.0);
+        for voice in crate::tts::LOCAL_VOICES.iter() {
+            let downloaded = crate::tts::voice_downloaded(voice, &dir);
+            let progress = app.synthesizer.download_status(voice.key);
+            let downloading = matches!(&progress, Some(DownloadState::Downloading { .. }));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let dot = if downloaded {
+                    palette.accent
+                } else {
+                    palette.secondary.gamma_multiply(0.6)
+                };
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.0, dot);
+                ui.label(voice.label);
+                theme::text(ui, voice.size, theme::regular(11.5), palette.secondary);
+                if let Some(DownloadState::Downloading { received, total }) = &progress {
+                    let fraction = total
+                        .filter(|total| *total > 0)
+                        .map(|total| *received as f32 / total as f32)
+                        .unwrap_or(0.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_height(14.0)
+                            .desired_width(120.0)
+                            .text(format!("{:.0}%", fraction * 100.0))
+                            .corner_radius(7.0),
+                    );
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if active == voice.key {
+                        theme::soft_button(ui, &palette, None, &gettext(locale, "Active"), true);
+                    } else if downloaded {
+                        if theme::soft_button(
+                            ui,
+                            &palette,
+                            Some(Icon::Check),
+                            &gettext(locale, "Use"),
+                            false,
+                        )
+                        .clicked()
+                        {
+                            app.actions.push(Action::SetTtsVoice(voice.key.to_owned()));
+                        }
+                    } else if downloading {
+                        if theme::soft_button(
+                            ui,
+                            &palette,
+                            Some(Icon::X),
+                            &gettext(locale, "Cancel"),
+                            false,
+                        )
+                        .clicked()
+                        {
+                            app.actions.push(Action::CancelTtsDownload(voice.key));
+                        }
+                    } else if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Download),
+                        &gettext(locale, "Download"),
+                        false,
+                    )
+                    .clicked()
+                    {
+                        app.actions.push(Action::DownloadTtsVoice(voice.key));
+                    }
+                    if downloaded
+                        && theme::icon_button(
+                            ui,
+                            Icon::Trash,
+                            14.0,
+                            palette.secondary,
+                            palette.danger,
+                            &gettext(locale, "Delete model"),
+                        )
+                        .clicked()
+                    {
+                        app.actions.push(Action::DeleteTtsVoice(voice.key));
+                    }
+                });
+            });
+            if let Some(DownloadState::Failed(error)) = &progress {
+                theme::text(
+                    ui,
+                    format!("{}: {error}", gettext(locale, "Download failed")),
+                    theme::regular(11.5),
+                    palette.danger,
+                );
+            }
+            ui.add_space(2.0);
+        }
+    });
+}
+
+/// Piper, the speech engine the local voices run on: install, progress, and
+/// removal.
+fn tts_piper_runtime(ui: &mut egui::Ui, app: &mut App) {
+    use crate::i18n::gettext;
+    use crate::transcription::DownloadState;
+    let palette = app.palette;
+    let locale = app.locale;
+    let installed = crate::tts::piper_ready(&app.dirs);
+    let progress = app
+        .synthesizer
+        .download_status(crate::tts::PIPER_PACKAGE_KEY);
+    ui.vertical(|ui| {
+        ui.label(
+            gettext(
+                locale,
+                "The speech engine the local voices run on. Nothing it says leaves this computer.",
+            )
+            .as_ref(),
+        );
+        ui.add_space(6.0);
+        if let Some(DownloadState::Downloading { received, total }) = &progress {
+            let fraction = total
+                .filter(|total| *total > 0)
+                .map(|total| *received as f32 / total as f32)
+                .unwrap_or(0.0);
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_height(14.0)
+                    .desired_width(200.0)
+                    .text(format!("{:.0}%", fraction * 100.0))
+                    .corner_radius(7.0),
+            );
+            ui.add_space(6.0);
+        }
+        ui.horizontal(|ui| {
+            theme::text(
+                ui,
+                crate::tts::PIPER_PACKAGE_SIZE,
+                theme::regular(11.5),
+                palette.secondary,
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if installed {
+                    if theme::icon_button(
+                        ui,
+                        Icon::Trash,
+                        14.0,
+                        palette.secondary,
+                        palette.danger,
+                        &gettext(locale, "Delete model"),
+                    )
+                    .clicked()
+                    {
+                        app.actions.push(Action::DeleteTtsPiper);
+                    }
+                    theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Check),
+                        &gettext(locale, "Installed"),
+                        true,
+                    );
+                } else if matches!(&progress, Some(DownloadState::Downloading { .. })) {
+                    if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::X),
+                        &gettext(locale, "Cancel"),
+                        false,
+                    )
+                    .clicked()
+                    {
+                        app.actions
+                            .push(Action::CancelTtsDownload(crate::tts::PIPER_PACKAGE_KEY));
+                    }
+                } else if theme::soft_button(
+                    ui,
+                    &palette,
+                    Some(Icon::Download),
+                    &gettext(locale, "Install"),
+                    false,
+                )
+                .clicked()
+                {
+                    app.actions.push(Action::DownloadTtsPiper);
+                }
+            });
+        });
+        if let Some(DownloadState::Failed(error)) = &progress {
+            theme::text(
+                ui,
+                format!("{}: {error}", gettext(locale, "Download failed")),
+                theme::regular(11.5),
+                palette.danger,
+            );
+        }
+    });
 }
 
 /// The Whisper models of the Transcription extension: sizes, download
@@ -2455,7 +2799,12 @@ fn privacy_control(ui: &mut egui::Ui, app: &mut App, kind: PrivacyKind) {
 }
 
 /// Theme filenames can contain emoji, so paint them through the shared line renderer.
-fn theme_option(ui: &mut egui::Ui, palette: &theme::Palette, text: &str, selected: bool) -> bool {
+pub(crate) fn theme_option(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    text: &str,
+    selected: bool,
+) -> bool {
     let response = ui.add(
         egui::Button::selectable(selected, " ").min_size(egui::vec2(ui.available_width(), 28.0)),
     );

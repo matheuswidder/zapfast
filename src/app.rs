@@ -374,6 +374,26 @@ pub struct UnreadDivider {
     pub placed: bool,
 }
 
+/// The TTS panel over the composer: what is being written, and the speech
+/// that was made of it.
+pub struct TtsDraft {
+    /// What the request is called, so the interface can find its state.
+    pub id: String,
+    /// The chat the voice message goes to.
+    pub chat: ChatId,
+    /// The text being written.
+    pub text: String,
+    /// The file the speech is in, once it is made. The name of the file is
+    /// the request's name, so the player can use the same one.
+    pub speech: Option<PathBuf>,
+    /// The samples to send, once the speech is made.
+    pub samples: Option<Vec<f32>>,
+    /// Why the speech could not be made.
+    pub error: Option<String>,
+    /// Whether the worker is speaking right now.
+    pub working: bool,
+}
+
 pub struct App {
     pub dirs: AppDirs,
     pub settings: Settings,
@@ -552,6 +572,13 @@ pub struct App {
     /// Downloads the interface has already reacted to, so it retries the
     /// pending clips once per settled download rather than once per frame.
     settled_downloads: u64,
+    /// Speech synthesis of the TTS extension.
+    pub synthesizer: crate::tts::Synthesizer,
+    /// The TTS panel over the composer: the text being written, the chat it
+    /// goes to, and the speech that was made of it.
+    pub tts: Option<TtsDraft>,
+    /// Counts the TTS requests, so each one gets a name of its own.
+    next_tts_id: u64,
     /// In-chat video player.
     pub video: crate::video::Player,
     /// Chat of the loaded video; leaving it stops the video.
@@ -1386,6 +1413,9 @@ impl App {
             transcriber: crate::transcription::Transcriber::new(waker.clone()),
             pending_transcription: Vec::new(),
             settled_downloads: 0,
+            synthesizer: crate::tts::Synthesizer::new(waker.clone()),
+            tts: None,
+            next_tts_id: 0,
             video: crate::video::Player::new(waker.clone()),
             video_chat: None,
             video_wanted: None,
@@ -5719,6 +5749,29 @@ impl App {
             self.settled_downloads = self.transcriber.settled_downloads();
             self.retry_pending_transcriptions();
         }
+        // The speech lands on the worker thread; the panel takes it when it
+        // is there.
+        let spoken = self
+            .tts
+            .as_ref()
+            .and_then(|draft| self.synthesizer.state(&draft.id));
+        if let (Some(draft), Some(state)) = (self.tts.as_mut(), spoken) {
+            match state {
+                crate::tts::SpeakState::Done { samples, path } => {
+                    draft.samples = Some(samples);
+                    draft.speech = Some(path);
+                    draft.working = false;
+                    draft.error = None;
+                }
+                crate::tts::SpeakState::Failed(error) => {
+                    draft.working = false;
+                    draft.error = Some(error);
+                }
+                crate::tts::SpeakState::Queued | crate::tts::SpeakState::Running => {
+                    draft.working = true;
+                }
+            }
+        }
         if !self.typing.is_empty() || self.composing {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
@@ -7244,6 +7297,84 @@ impl App {
             Action::CancelTranscriptionGpuDownload => {
                 self.transcriber
                     .cancel_download(crate::transcription::GPU_PACKAGE_KEY);
+            }
+            Action::SetTtsEnabled(on) => {
+                self.settings.tts_enabled = on;
+                self.mark_settings_dirty();
+            }
+            Action::SetTtsSource(source) => {
+                self.settings.tts_source = source;
+                // The two sources name their voices differently, so the other
+                // one's name would not resolve to anything.
+                self.settings.tts_voice = match source {
+                    crate::settings::TtsSource::Local => crate::tts::LOCAL_VOICES[0].key.to_owned(),
+                    crate::settings::TtsSource::Remote => {
+                        crate::tts::REMOTE_VOICES[0].name.to_owned()
+                    }
+                };
+                self.mark_settings_dirty();
+            }
+            Action::SetTtsVoice(voice) => {
+                self.settings.tts_voice = voice;
+                self.mark_settings_dirty();
+            }
+            Action::SetTtsEndpoint(endpoint) => {
+                self.settings.tts_endpoint = endpoint;
+                self.mark_settings_dirty();
+            }
+            Action::SetTtsKey(key) => {
+                // The token lives in the OS keyring, not in the settings file.
+                if let Err(error) = crate::secret::store(crate::tts::TTS_TOKEN, &key) {
+                    self.toast_error(error);
+                }
+            }
+            Action::OpenTts => {
+                if let Some(chat) = self.open_chat.clone() {
+                    self.tts = Some(TtsDraft {
+                        id: String::new(),
+                        chat,
+                        text: String::new(),
+                        speech: None,
+                        samples: None,
+                        error: None,
+                        working: false,
+                    });
+                }
+            }
+            Action::SpeakTts { chat, text } => {
+                self.speak_tts(chat, text);
+            }
+            Action::SendTts { chat } => {
+                self.send_tts(chat);
+            }
+            Action::DiscardTts => {
+                self.tts = None;
+            }
+            Action::DownloadTtsPiper => {
+                self.synthesizer
+                    .download_piper(self.dirs.clone(), self.waker.clone());
+            }
+            Action::CancelTtsDownload(key) => {
+                self.synthesizer.cancel_download(key);
+            }
+            Action::DeleteTtsPiper => {
+                if let Err(error) = crate::tts::Synthesizer::delete_piper(&self.dirs) {
+                    self.toast_error(error.to_string());
+                }
+            }
+            Action::DownloadTtsVoice(key) => {
+                if let Some(voice) = crate::tts::local_voice_by_key(key) {
+                    self.synthesizer
+                        .download_voice(voice, self.dirs.clone(), self.waker.clone());
+                }
+            }
+            Action::DeleteTtsVoice(key) => {
+                if let Some(voice) = crate::tts::local_voice_by_key(key) {
+                    let dir = crate::tts::models_dir(&self.dirs);
+                    if let Err(error) = crate::tts::Synthesizer::delete_voice(voice, &dir) {
+                        self.toast_error(error.to_string());
+                    }
+                }
             }
             Action::DeleteTranscriptionGpu => {
                 if let Err(error) = crate::transcription::delete_gpu(&self.dirs) {
@@ -9417,6 +9548,82 @@ impl App {
             .take_while(|message| voice_note(message))
             .find(|message| !message.from_me && !self.played_told.contains(&message.id))
             .map(|message| message.id.clone())
+    }
+
+    /// Speaks a text and leaves the speech ready to be listened to. The
+    /// worker does the talking, so the interface never waits for it.
+    fn speak_tts(&mut self, chat: ChatId, text: String) {
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let id = format!("tts-{}", self.next_tts_id);
+        self.next_tts_id += 1;
+        let dir = self.dirs.cache.join("tts");
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.toast_error("could not write the speech".to_owned());
+            return;
+        }
+        let output = dir.join(format!("{id}.wav"));
+        let request = match self.settings.tts_source {
+            crate::settings::TtsSource::Local => {
+                let voice = crate::tts::selected_local_voice(&self.settings);
+                crate::tts::Request {
+                    id: id.clone(),
+                    text: text.clone(),
+                    source: crate::settings::TtsSource::Local,
+                    piper: crate::tts::piper_path(&self.dirs),
+                    model: Some(crate::tts::models_dir(&self.dirs).join(voice.file)),
+                    endpoint: None,
+                    voice: None,
+                    key: None,
+                    output,
+                }
+            }
+            crate::settings::TtsSource::Remote => {
+                let voice = crate::tts::selected_remote_voice(&self.settings);
+                crate::tts::Request {
+                    id: id.clone(),
+                    text: text.clone(),
+                    source: crate::settings::TtsSource::Remote,
+                    piper: None,
+                    model: None,
+                    endpoint: Some(self.settings.tts_endpoint.clone()),
+                    voice: Some(voice.model.to_owned()),
+                    key: crate::secret::load(crate::tts::TTS_TOKEN),
+                    output,
+                }
+            }
+        };
+        self.tts = Some(TtsDraft {
+            id,
+            chat,
+            text,
+            speech: None,
+            samples: None,
+            error: None,
+            working: true,
+        });
+        self.synthesizer.speak(request);
+    }
+
+    /// Sends the speech that was listened to, as a voice message of the chat
+    /// the panel was opened in.
+    fn send_tts(&mut self, chat: ChatId) {
+        let Some(draft) = self.tts.as_ref() else {
+            return;
+        };
+        let Some(samples) = draft.samples.clone() else {
+            return;
+        };
+        let quoting = self.reply_to.take();
+        self.backend.send(Command::SendVoice {
+            chat,
+            samples,
+            quoting,
+        });
+        self.follow_outgoing();
+        self.tts = None;
     }
 
     /// Stops and sends a recording unless it is under one second. With no

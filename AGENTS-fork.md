@@ -21,7 +21,7 @@ aparece dentro dela, e os clipes ficam só na memória da sessão.
 | Remoto do dono | `upstream` → `https://github.com/crmne/zapfast.git` |
 | Remoto próprio | `origin` → `https://github.com/matheuswidder/zapfast.git` |
 | Fork | <https://github.com/matheuswidder/zapfast> |
-| Base neste momento | `upstream/main` @ `29d0a39` (merge de 21/10/2026) |
+| Base neste momento | `upstream/main` @ `0e9d21a` (merge de 21/10/2026) |
 
 Três commits, deliberadamente separados para deixar o merge barato:
 
@@ -129,7 +129,7 @@ cargo test  --locked --all-targets
 ```
 
 Referência do que passou no último merge: fmt limpo, clippy limpo,
-**1884 testes ok, 0 falhas** (merge de 21/10/2026; no v0.9.0 eram 1842, antes
+**1900 testes ok, 0 falhas** (merge de 21/10/2026; no v0.9.0 eram 1842, antes
 1114).
 
 ## Ambiente de build nesta máquina

@@ -387,6 +387,28 @@ impl TranscriptionAuto {
     }
 }
 
+/// Where the TTS extension's speech comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsSource {
+    /// A voice that runs on this computer. The text never leaves it.
+    #[default]
+    Local,
+    /// A service that speaks the text.
+    Remote,
+}
+
+impl TtsSource {
+    pub const ALL: [Self; 2] = [Self::Local, Self::Remote];
+
+    pub fn label(self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Local => crate::i18n::gettext(locale, "On this computer"),
+            Self::Remote => crate::i18n::gettext(locale, "A service"),
+        }
+    }
+}
+
 /// Which chats show one notification, then stay quiet for ten minutes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -596,6 +618,14 @@ pub struct Settings {
     pub transcription_auto: TranscriptionAuto,
     /// Chats transcribed on their own when the scope is specific chats.
     pub transcription_chats: Vec<String>,
+    /// The TTS extension: turning text into a voice message.
+    pub tts_enabled: bool,
+    /// Where the speech comes from.
+    pub tts_source: TtsSource,
+    /// The voice: a local voice's key, or a remote voice's name.
+    pub tts_voice: String,
+    /// The service the remote source talks to.
+    pub tts_endpoint: String,
 }
 
 impl Default for Settings {
@@ -659,6 +689,10 @@ impl Default for Settings {
             transcription_gpu: false,
             transcription_auto: TranscriptionAuto::Off,
             transcription_chats: Vec::new(),
+            tts_enabled: false,
+            tts_source: TtsSource::default(),
+            tts_voice: crate::tts::LOCAL_VOICES[0].key.to_owned(),
+            tts_endpoint: crate::tts::DEFAULT_ENDPOINT.to_owned(),
         }
     }
 }

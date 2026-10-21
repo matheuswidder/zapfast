@@ -21,6 +21,7 @@ use crate::theme::{self, Icon, Palette};
 use crate::wallpaper;
 
 use super::focus::{self, Stop, TabStop};
+use super::settings::theme_option;
 use super::widgets;
 
 /// Group-message avatar size.
@@ -1538,6 +1539,12 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 .unwrap_or(line_height)
                 .clamp(line_height, line_height * 6.0);
             let row_height = (text_height + 2.0 * field_margin).max(line);
+            // The TTS panel sits over the composer, where the text it holds
+            // can be read and changed without leaving the chat.
+            if app.tts.is_some() {
+                tts_panel(app, ui);
+                ui.add_space(6.0);
+            }
             let pill = widgets::raised(ui, &palette, composer_pill(&palette), |ui| {
             ui.allocate_ui_with_layout(
                 vec2(ui.available_width(), row_height),
@@ -1587,8 +1594,18 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     ui.add_space(COMPOSER_TEXT_GAP - ui.spacing().item_spacing.x - 8.0);
                 }
                 // The send button closes the row, flush with the field's end.
-                let field_width =
-                    (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(0.0);
+                // The TTS button takes its place next to the microphone, so
+                // the field gives up the width of both.
+                let tts_width = if app.settings.tts_enabled && app.tts.is_none() {
+                    22.0 + crate::theme::ICON_BUTTON_PAD
+                } else {
+                    0.0
+                };
+                let field_width = (ui.available_width()
+                    - button_width
+                    - tts_width
+                    - ui.spacing().item_spacing.x * 2.0)
+                    .max(0.0);
                 // The ink is centred on the controls, not the line box: the
                 // span from a capital's top to a descender's bottom sits as far
                 // from the field's top as from its bottom. Inter's box leaves
@@ -1796,7 +1813,24 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 } else {
                     (palette.surface, palette.surface_hover, palette.dim)
                 };
-                last_line(ui, line, |ui| if !ready && app.editing.is_none() {
+                last_line(ui, line, |ui| {
+                // The TTS button sits next to the microphone, on the side
+                // away from the field, so the two audio controls read as a
+                // pair.
+                if app.settings.tts_enabled && app.tts.is_none() {
+                    let tts = theme::icon_button(
+                        ui,
+                        Icon::Volume2,
+                        22.0,
+                        palette.secondary,
+                        palette.text,
+                        &crate::i18n::gettext(app.locale, "Speak a message"),
+                    );
+                    if tts.clicked() {
+                        app.actions.push(Action::OpenTts);
+                    }
+                }
+                if !ready && app.editing.is_none() {
                     // An empty composer changes the send button to record.
                     if theme::circle_button(
                         ui,
@@ -1824,6 +1858,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     {
                         send_click = true;
                     }
+                }
                 });
             },
                     );
@@ -2119,6 +2154,228 @@ fn unsent_voice_strip(app: &mut App, ui: &mut egui::Ui, samples: usize) {
         });
     });
     strip_gap(ui);
+}
+
+/// The TTS panel over the composer: the text to speak, the voice that
+/// speaks it, and the speech that was made of it.
+fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let mut close = false;
+    let mut speak = false;
+    let mut send = false;
+    let mut discard = false;
+    let mut play = false;
+    let (chat, text) = {
+        let Some(draft) = app.tts.as_mut() else {
+            return;
+        };
+        let chat = draft.chat.clone();
+        let text = draft.text.clone();
+        let ready = draft.samples.is_some();
+        let working = draft.working;
+        let error = draft.error.clone();
+        let source = app.settings.tts_source;
+        let voice = app.settings.tts_voice.clone();
+        let endpoint = app.settings.tts_endpoint.clone();
+        widgets::raised(ui, &palette, strip_frame(&palette), |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                theme::icon(ui, Icon::Volume2, 16.0, palette.accent);
+                theme::text(
+                    ui,
+                    crate::i18n::gettext(locale, "Speak a message").into_owned(),
+                    theme::semibold(12.5),
+                    palette.text,
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let button = theme::icon_button(
+                        ui,
+                        Icon::X,
+                        16.0,
+                        palette.secondary,
+                        palette.text,
+                        &crate::i18n::gettext(locale, "Close"),
+                    );
+                    if button.clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            egui::TextEdit::multiline(&mut draft.text)
+                .id(egui::Id::new(("tts-text", &draft.chat)))
+                .desired_rows(3)
+                .hint_text(
+                    egui::RichText::new(
+                        crate::i18n::gettext(locale, "Type what to say").into_owned(),
+                    )
+                    .color(palette.dim)
+                    .font(theme::regular(BODY_SIZE)),
+                )
+                .font(theme::regular(BODY_SIZE))
+                .text_color(palette.text)
+                .frame(Frame::NONE)
+                .show(ui);
+            ui.add_space(8.0);
+            // The voice depends on where the speech comes from, so the two
+            // pickers travel together.
+            ui.horizontal(|ui| {
+                let response = egui::ComboBox::from_id_salt("tts-source")
+                    .selected_text(source.label(locale))
+                    .width(140.0_f32.min(ui.available_width()))
+                    .show_ui(ui, |ui| {
+                        for option in crate::settings::TtsSource::ALL {
+                            if theme_option(
+                                ui,
+                                &palette,
+                                option.label(locale).as_ref(),
+                                option == source,
+                            ) {
+                                app.actions.push(Action::SetTtsSource(option));
+                            }
+                        }
+                    });
+                theme::reveal_focus(&response.response);
+                ui.add_space(8.0);
+                let selected = match source {
+                    crate::settings::TtsSource::Local => crate::tts::local_voice_by_key(&voice)
+                        .map(|found| found.label)
+                        .unwrap_or(crate::tts::LOCAL_VOICES[0].label),
+                    crate::settings::TtsSource::Remote => crate::tts::remote_voice_by_name(&voice)
+                        .map(|found| found.label)
+                        .unwrap_or(crate::tts::REMOTE_VOICES[0].label),
+                };
+                let response = egui::ComboBox::from_id_salt("tts-voice")
+                    .selected_text(selected)
+                    .width(160.0_f32.min(ui.available_width()))
+                    .show_ui(ui, |ui| match source {
+                        crate::settings::TtsSource::Local => {
+                            for option in crate::tts::LOCAL_VOICES {
+                                if theme_option(ui, &palette, option.label, option.key == voice) {
+                                    app.actions.push(Action::SetTtsVoice(option.key.to_owned()));
+                                }
+                            }
+                        }
+                        crate::settings::TtsSource::Remote => {
+                            for option in crate::tts::REMOTE_VOICES {
+                                if theme_option(ui, &palette, option.label, option.name == voice) {
+                                    app.actions
+                                        .push(Action::SetTtsVoice(option.name.to_owned()));
+                                }
+                            }
+                        }
+                    });
+                theme::reveal_focus(&response.response);
+            });
+            if source == crate::settings::TtsSource::Remote {
+                ui.add_space(6.0);
+                egui::TextEdit::singleline(&mut app.settings.tts_endpoint)
+                    .id(egui::Id::new("tts-endpoint"))
+                    .desired_width(f32::INFINITY)
+                    .hint_text(
+                        egui::RichText::new(
+                            crate::i18n::gettext(locale, "Service address").into_owned(),
+                        )
+                        .color(palette.dim)
+                        .font(theme::regular(BODY_SIZE)),
+                    )
+                    .font(theme::regular(BODY_SIZE))
+                    .text_color(palette.text)
+                    .show(ui);
+                let _ = endpoint;
+            }
+            ui.add_space(8.0);
+            if let Some(error) = &error {
+                theme::text(ui, error.clone(), theme::regular(12.5), palette.danger);
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                let generate = theme::pill_button(
+                    ui,
+                    &palette,
+                    &crate::i18n::gettext(locale, "Generate"),
+                    true,
+                );
+                if generate.clicked() && !text.trim().is_empty() {
+                    speak = true;
+                }
+                if working {
+                    theme::text(
+                        ui,
+                        crate::i18n::gettext(locale, "Speaking...").into_owned(),
+                        theme::regular(12.5),
+                        palette.dim,
+                    );
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ready {
+                        let send_button = theme::pill_button(
+                            ui,
+                            &palette,
+                            &crate::i18n::gettext(locale, "Send"),
+                            true,
+                        );
+                        if send_button.clicked() {
+                            send = true;
+                        }
+                        let again = theme::soft_button(
+                            ui,
+                            &palette,
+                            None,
+                            &crate::i18n::gettext(locale, "Say it again"),
+                            false,
+                        );
+                        if again.clicked() {
+                            speak = true;
+                        }
+                        let play_button = theme::icon_button(
+                            ui,
+                            Icon::Play,
+                            16.0,
+                            palette.secondary,
+                            palette.text,
+                            &crate::i18n::gettext(locale, "Listen"),
+                        );
+                        if play_button.clicked() {
+                            play = true;
+                        }
+                        let discard_button = theme::icon_button(
+                            ui,
+                            Icon::Trash,
+                            16.0,
+                            palette.secondary,
+                            palette.text,
+                            &crate::i18n::gettext(locale, "Discard voice message"),
+                        );
+                        if discard_button.clicked() {
+                            discard = true;
+                        }
+                    }
+                });
+            });
+        });
+        (chat, text)
+    };
+    if close || discard {
+        app.actions.push(Action::DiscardTts);
+    }
+    if speak {
+        app.actions.push(Action::SpeakTts {
+            chat: chat.clone(),
+            text,
+        });
+    }
+    if send {
+        app.actions.push(Action::SendTts { chat });
+    }
+    if play {
+        if let Some(draft) = app.tts.as_ref()
+            && let Some(path) = draft.speech.clone()
+        {
+            let _ = app.player.toggle(&draft.id, &path);
+        }
+    }
 }
 
 fn edit_strip(app: &mut App, ui: &mut egui::Ui) {

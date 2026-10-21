@@ -2596,6 +2596,39 @@ pub enum Action {
         chat: String,
         on: bool,
     },
+    /// Turns the TTS extension on or off.
+    SetTtsEnabled(bool),
+    /// Picks where the speech comes from: this computer or a service.
+    SetTtsSource(crate::settings::TtsSource),
+    /// Picks the voice the extension speaks with.
+    SetTtsVoice(String),
+    /// Sets the service the remote source talks to.
+    SetTtsEndpoint(String),
+    /// Stores the service's token in the OS keyring.
+    SetTtsKey(String),
+    /// Speaks a text and leaves the speech ready to be listened to.
+    SpeakTts {
+        chat: String,
+        text: String,
+    },
+    /// Sends the speech that was listened to, as a voice message.
+    SendTts {
+        chat: String,
+    },
+    /// Throws the speech away and closes the panel.
+    DiscardTts,
+    /// Opens the TTS panel over the composer.
+    OpenTts,
+    /// Downloads Piper's binary, which speaks the text on this computer.
+    DownloadTtsPiper,
+    /// Stops a download the reader started by mistake.
+    CancelTtsDownload(&'static str),
+    /// Removes Piper's binary.
+    DeleteTtsPiper,
+    /// Downloads a local voice's model.
+    DownloadTtsVoice(&'static str),
+    /// Removes a downloaded voice.
+    DeleteTtsVoice(&'static str),
     /// Plays or pauses a downloaded video inside its message.
     PlayVideo {
         message: String,

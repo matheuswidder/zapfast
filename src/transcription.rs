@@ -548,7 +548,7 @@ fn fetch_model(
 }
 
 /// Downloads `url` to `path`, reporting progress under `key`.
-fn fetch_url(
+pub(crate) fn fetch_url(
     url: &str,
     path: &Path,
     key: &str,
@@ -710,6 +710,13 @@ fn transcribe_external(job: &Job, cli: &Path) -> Result<String, String> {
 
 /// Writes mono f32 samples as a 16-bit PCM WAV at `WHISPER_RATE`.
 fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
+    write_wav_at(path, samples, WHISPER_RATE)
+}
+
+/// Writes mono f32 samples as a 16-bit PCM WAV at the rate they were taken
+/// at. The synthesis extension reuses this to leave a file the player can
+/// play.
+pub(crate) fn write_wav_at(path: &Path, samples: &[f32], rate: u32) -> std::io::Result<()> {
     use std::io::Write;
     let data: Vec<u8> = samples
         .iter()
@@ -726,8 +733,8 @@ fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
     file.write_all(&16u32.to_le_bytes())?;
     file.write_all(&1u16.to_le_bytes())?; // PCM
     file.write_all(&1u16.to_le_bytes())?; // mono
-    file.write_all(&WHISPER_RATE.to_le_bytes())?;
-    file.write_all(&(WHISPER_RATE * 2).to_le_bytes())?; // byte rate
+    file.write_all(&rate.to_le_bytes())?;
+    file.write_all(&(rate * 2).to_le_bytes())?; // byte rate
     file.write_all(&2u16.to_le_bytes())?; // block align
     file.write_all(&16u16.to_le_bytes())?; // bits per sample
     file.write_all(b"data")?;
@@ -788,7 +795,7 @@ const WHISPER_RATE: u32 = 16_000;
 /// Linear resample of mono audio. Voice notes decode at 48 kHz, but an audio
 /// attachment can arrive at any rate the container declares, so the factor is
 /// computed rather than assumed.
-fn resample(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
+pub(crate) fn resample(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
     if samples.is_empty() || from == 0 || to == 0 || from == to {
         return samples.to_vec();
     }
@@ -806,7 +813,7 @@ fn resample(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
 }
 
 /// Decodes a non-OGG audio file through rodio into mono f32 at the source rate.
-fn decode_other(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
+pub(crate) fn decode_other(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
     use rodio::Source;
     let cursor = std::io::Cursor::new(bytes.to_vec());
     let source = rodio::Decoder::new(cursor).map_err(|error| error.to_string())?;

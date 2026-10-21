@@ -2966,3 +2966,99 @@ msgstr "Conversas escolhidas"
 
 msgid "Choose the chats"
 msgstr "Escolha as conversas"
+
+#: src/ui/conversation.rs
+msgid "Speak a message"
+msgstr "Falar uma mensagem"
+
+#: src/ui/conversation.rs
+msgid "Type what to say"
+msgstr "Digite o que dizer"
+
+#: src/ui/conversation.rs
+msgid "Generate"
+msgstr "Gerar"
+
+#: src/ui/conversation.rs
+msgid "Speaking..."
+msgstr "Falando..."
+
+#: src/ui/conversation.rs
+msgid "Say it again"
+msgstr "Dizer de novo"
+
+#: src/ui/conversation.rs
+msgid "Listen"
+msgstr "Ouvir"
+
+#: src/ui/conversation.rs
+msgid "Service address"
+msgstr "Endereço do serviço"
+
+#: src/settings.rs
+msgid "On this computer"
+msgstr "Neste computador"
+
+#: src/settings.rs
+msgid "A service"
+msgstr "Um serviço"
+
+#: src/ui/settings.rs
+msgid "Speak messages"
+msgstr "Falar mensagens"
+
+#: src/ui/settings.rs
+msgid "Turn text into a voice message. A local voice runs on this computer; a service speaks the text over the network."
+msgstr "Transforme texto em mensagem de voz. Uma voz local roda neste computador; um serviço fala o texto pela rede."
+
+#: src/ui/settings.rs
+msgid "Where the speech comes from"
+msgstr "De onde vem a fala"
+
+#: src/ui/settings.rs
+msgid "On this computer the text never leaves it; a service sends it over the network."
+msgstr "Neste computador o texto nunca sai daqui; um serviço o envia pela rede."
+
+#: src/ui/settings.rs
+msgid "Voice"
+msgstr "Voz"
+
+#: src/ui/settings.rs
+msgid "The voice that speaks the text."
+msgstr "A voz que fala o texto."
+
+#: src/ui/settings.rs
+msgid "Piper"
+msgstr "Piper"
+
+#: src/ui/settings.rs
+msgid "Voice model"
+msgstr "Modelo de voz"
+
+#: src/ui/settings.rs
+msgid "Service token"
+msgstr "Token do serviço"
+
+#: src/ui/settings.rs
+msgid "Kept in the OS keyring, never in the settings file."
+msgstr "Guardado no cofre do sistema, nunca no arquivo de configurações."
+
+#: src/ui/settings.rs
+msgid "The service's token"
+msgstr "O token do serviço"
+
+#: src/ui/settings.rs
+msgid "Where the text is sent to be spoken."
+msgstr "Para onde o texto é enviado para ser falado."
+
+#: src/ui/settings.rs
+msgid "The local voices run on this computer."
+msgstr "As vozes locais rodam neste computador."
+
+#: src/ui/settings.rs
+msgid "The speech engine the local voices run on. Nothing it says leaves this computer."
+msgstr "O motor de fala que as vozes locais usam. Nada do que ele fala sai deste computador."
+
+#: src/ui/settings.rs
+msgid "Installed"
+msgstr "Instalado"
