@@ -21,13 +21,18 @@ aparece dentro dela, e os clipes ficam só na memória da sessão.
 | Remoto do dono | `upstream` → `https://github.com/crmne/zapfast.git` |
 | Remoto próprio | `origin` → `https://github.com/matheuswidder/zapfast.git` |
 | Fork | <https://github.com/matheuswidder/zapfast> |
-| Base neste momento | `upstream/main` @ `007d388` (v0.9.0, merge de 15/10/2026) |
+| Base neste momento | `upstream/main` @ `29d0a39` (merge de 21/10/2026) |
 
-Três commits, deliberadamente separados para deixar o rebase barato:
+Três commits, deliberadamente separados para deixar o merge barato:
 
 1. `Add local Whisper transcription for voice messages` — todo o código
 2. `Show transcription states in the headless layout tests` — `src/demo.rs`
 3. `Document the Transcription extension` — `docs/` e `assets/i18n/pt-BR.po`
+
+Depois vieram o runbook deste arquivo, o merge do upstream v0.9.0, a correção
+que o clippy apontou nos testes, a aceleração por GPU (`066890c`, com o
+runtime CUDA do whisper.cpp baixado sob demanda) e o merge do upstream de
+21/10/2026.
 
 A branch está no GitHub. **Se a máquina for formatada, nada se perde.**
 
@@ -59,16 +64,34 @@ Se aparecer algo nos seus arquivos (`app.rs`, `ui/conversation.rs`,
 `ui/settings.rs`, `settings.rs`, `model.rs`, `demo.rs`), traga para dentro:
 
 ```sh
-git rebase upstream/main
+git tag backup-before-upmerge-$(date +%F)   # rede de segurança
+git merge upstream/main
 ```
 
-Se der ruim, `git rebase --abort` volta ao estado anterior sem perder nada.
-Existe também a tag `backup-before-rebase` como rede extra.
+O **merge** é o que os dois últimos syncs usaram (`73a4273`, para o v0.9.0, e
+o de 21/10/2026). Ele preserva o hash dos commits do fork e dispensa
+force-push. Se der ruim, `git merge --abort` volta ao estado anterior sem
+perder nada.
 
-### O conflito que vai acontecer: `pt-BR.po`
+O `git rebase upstream/main` continua valendo como alternativa, e sai mais
+barato quando o upstream não mexeu nos seus arquivos: o rebase de 29/10/2026
+deu conflito em **um arquivo só**, o catálogo de traduções, e o código
+aplicou limpo nos outros dois commits. O rebase reescreve o hash dos commits
+do fork, então a branch precisa de force-push depois.
 
-O rebase de 29/10/2026 deu conflito em **um arquivo só**, o catálogo de
-traduções, e o código aplicou limpo nos outros dois commits.
+### Conflitos que aparecem
+
+**`Cargo.lock`** — é o lock do upstream mais o `whisper-rs` do fork. Não
+resolva à mão: depois de resolver o conflito, rode `cargo metadata` **sem**
+`--locked` e o cargo acrescenta sozinho o que falta. No merge de 21/10/2026
+foram `whisper-rs`, `whisper-rs-sys` e `fs_extra`. O `bindgen` fica com
+`log` e `prettyplease` **além** do `annotate-snippets` do upstream, porque a
+feature `logging` do bindgen é ativada pelo `whisper-rs-sys` — feature
+unificada, os dois lados. Se o lock ficar errado, o `--locked` do clippy
+falha e o cargo diz o que falta.
+
+**`assets/i18n/pt-BR.po`** — o catálogo de traduções. O rebase de 29/10/2026
+deu conflito nesse arquivo e o código aplicou limpo nos outros dois commits.
 
 **O lado `HEAD` desse conflito costuma estar vazio** (o dono acrescenta as
 entradas dele *antes* do seu bloco), então a resolução é ficar com o lado do
@@ -81,6 +104,12 @@ git checkout --theirs assets/i18n/pt-BR.po
 # CERTO: mantém tudo do dono E o seu bloco
 ```
 
+Cuidado que `--theirs` muda de sentido entre rebase e merge: no **rebase**
+`--theirs` é o seu commit (o que está sendo reaplicado) e `--ours` é o
+upstream; no **merge** é o contrário — `--theirs` é o upstream e `--ours` é
+o seu. O comando acima está escrito para o rebase, que é onde o conflito
+aconteceu. Numa sessão de merge, `--theirs` aqui joga fora o lado do dono.
+
 Ao resolver, **confirme os dois lados**. Verificar só "não removi nada do
 upstream" não basta — foi exatamente esse o erro que cometi: o arquivo ficou
 sem nenhuma entrada de transcrição e a UI passou a falar inglês, com testes
@@ -91,7 +120,7 @@ grep -c 'msgid "Extensions"\|msgid "Delete model"' assets/i18n/pt-BR.po   # tem 
 git diff upstream/main -- assets/i18n/pt-BR.po | grep -c '^-[^-]'        # tem que ser 0
 ```
 
-### Depois de rebasar, sempre
+### Depois de sincronizar, sempre
 
 ```sh
 cargo fmt --all --check
@@ -99,8 +128,9 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test  --locked --all-targets
 ```
 
-Referência do que passou no último rebase: fmt limpo, clippy limpo,
-**1842 testes ok, 0 falhas** (após o merge v0.9.0; antes eram 1114).
+Referência do que passou no último merge: fmt limpo, clippy limpo,
+**1884 testes ok, 0 falhas** (merge de 21/10/2026; no v0.9.0 eram 1842, antes
+1114).
 
 ## Ambiente de build nesta máquina
 
