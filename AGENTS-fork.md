@@ -282,6 +282,24 @@ pegaram. O painel do TTS (`speaking`) é um deles: o botão novo no compositor
 muda a largura do campo, e o teste `suggestion_lists_sit_close_above_the_composer`
 descobre se a conta está errada.
 
+## Revisar o frontend com o 9router
+
+O proxy do 9router (`https://proxy.widder.cloud/v1`) serve modelos que
+veem imagem, e o `gemini-3.8-flash-high` (`ag/gemini-3.8-flash-high`,
+Antigravity, raciocínio alto) serve bem para isso. A chave fica em
+`C:\Users\teco_\.config\9router\api-key.txt` e nunca é ecoada.
+
+O proxy responde em streaming: são eventos `data:` e o texto vem em
+`delta.content`. Para uma revisão de interface, o caminho que funcionou é
+mandar as **capturas** junto do **código** e do texto de interface, e pedir
+trochos exatos em Rust, não ideias. Em duas rodadas ele apontou coisas que
+os testes não pegam — dois botões para a mesma ação, o horário no meio do
+balão, um menu que ainda usava o egui cru — e uma que estava errada: o
+contador de linhas do `TextEdit` esticava a linha inteira.
+
+O script usado está em `C:\Users\teco_\AppData\Local\Temp\ask9router.py`
+(fora do repositório, porque leva a chave).
+
 ## Pendência conhecida
 
 `.github/scripts/update-translations.sh --check` **não roda nesta máquina**:
