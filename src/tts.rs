@@ -29,7 +29,9 @@ pub struct LocalVoice {
     /// The key the settings file holds.
     pub key: &'static str,
     /// The name the interface shows.
-    pub label: &'static str,
+    pub name: &'static str,
+    /// What the voice is, in the interface's language.
+    pub description: &'static str,
     /// The model file the download source publishes.
     pub file: &'static str,
     /// How big the download is, for the interface.
@@ -45,6 +47,15 @@ impl LocalVoice {
     pub fn config_file(&self) -> String {
         format!("{}.json", self.file)
     }
+
+    /// The name and what the voice is, in the interface's language.
+    pub fn label(&self, locale: crate::i18n::Locale) -> String {
+        format!(
+            "{} ({})",
+            self.name,
+            crate::i18n::gettext(locale, self.description)
+        )
+    }
 }
 
 /// The key Piper's package download is filed under.
@@ -55,7 +66,8 @@ pub const PIPER_PACKAGE_KEY: &str = "piper";
 pub const LOCAL_VOICES: [LocalVoice; 4] = [
     LocalVoice {
         key: "faber",
-        label: "Faber (male, news anchor)",
+        name: "Faber",
+        description: "a news anchor's voice",
         file: "pt_BR-faber-medium.onnx",
         size: "63 MB",
         model_url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx",
@@ -63,7 +75,8 @@ pub const LOCAL_VOICES: [LocalVoice; 4] = [
     },
     LocalVoice {
         key: "jeff",
-        label: "Jeff (male)",
+        name: "Jeff",
+        description: "a man's voice",
         file: "pt_BR-jeff-medium.onnx",
         size: "63 MB",
         model_url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/jeff/medium/pt_BR-jeff-medium.onnx",
@@ -71,7 +84,8 @@ pub const LOCAL_VOICES: [LocalVoice; 4] = [
     },
     LocalVoice {
         key: "cadu",
-        label: "Cadu (male)",
+        name: "Cadu",
+        description: "a man's voice",
         file: "pt_BR-cadu-medium.onnx",
         size: "63 MB",
         model_url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/cadu/medium/pt_BR-cadu-medium.onnx",
@@ -79,7 +93,8 @@ pub const LOCAL_VOICES: [LocalVoice; 4] = [
     },
     LocalVoice {
         key: "edresson",
-        label: "Edresson (male, lighter)",
+        name: "Edresson",
+        description: "a lighter man's voice",
         file: "pt_BR-edresson-low.onnx",
         size: "63 MB",
         model_url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/edresson/low/pt_BR-edresson-low.onnx",
@@ -89,12 +104,25 @@ pub const LOCAL_VOICES: [LocalVoice; 4] = [
 
 /// A voice a remote service speaks with.
 pub struct RemoteVoice {
-    /// The name the service knows the voice by.
+    /// The name the service knows the voice by, and the settings hold.
     pub name: &'static str,
     /// The name the interface shows.
-    pub label: &'static str,
+    pub title: &'static str,
+    /// What the voice is, in the interface's language.
+    pub description: &'static str,
     /// What the service is asked for.
     pub model: &'static str,
+}
+
+impl RemoteVoice {
+    /// The name and what the voice is, in the interface's language.
+    pub fn label(&self, locale: crate::i18n::Locale) -> String {
+        format!(
+            "{} ({})",
+            self.title,
+            crate::i18n::gettext(locale, self.description)
+        )
+    }
 }
 
 /// The voices the Edge service answers for. The list is short because the
@@ -103,22 +131,26 @@ pub struct RemoteVoice {
 pub const REMOTE_VOICES: [RemoteVoice; 4] = [
     RemoteVoice {
         name: "pt-BR-ThalitaMultilingualNeural",
-        label: "Thalita (female)",
+        title: "Thalita",
+        description: "a woman's voice",
         model: "edge-tts/pt-BR-ThalitaMultilingualNeural",
     },
     RemoteVoice {
         name: "pt-BR-ThalitaNeural",
-        label: "Thalita (female, classic)",
+        title: "Thalita",
+        description: "a woman's voice, the classic one",
         model: "edge-tts/pt-BR-ThalitaNeural",
     },
     RemoteVoice {
         name: "pt-BR-FranciscaNeural",
-        label: "Francisca (female)",
+        title: "Francisca",
+        description: "a woman's voice",
         model: "edge-tts/pt-BR-FranciscaNeural",
     },
     RemoteVoice {
         name: "pt-BR-AntonioNeural",
-        label: "Antonio (male)",
+        title: "Antonio",
+        description: "a man's voice",
         model: "edge-tts/pt-BR-AntonioNeural",
     },
 ];

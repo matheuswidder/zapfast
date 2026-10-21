@@ -1028,11 +1028,11 @@ fn sections(app: &App) -> Vec<Section> {
                 let voice = app.settings.tts_voice.clone();
                 let selected = match source {
                     crate::settings::TtsSource::Local => crate::tts::local_voice_by_key(&voice)
-                        .map(|found| found.label)
-                        .unwrap_or(crate::tts::LOCAL_VOICES[0].label),
+                        .map(|found| found.label(locale))
+                        .unwrap_or_else(|| crate::tts::LOCAL_VOICES[0].label(locale)),
                     crate::settings::TtsSource::Remote => crate::tts::remote_voice_by_name(&voice)
-                        .map(|found| found.label)
-                        .unwrap_or(crate::tts::REMOTE_VOICES[0].label),
+                        .map(|found| found.label(locale))
+                        .unwrap_or_else(|| crate::tts::REMOTE_VOICES[0].label(locale)),
                 };
                 let response = egui::ComboBox::from_id_salt("tts_voice")
                     .selected_text(selected)
@@ -1040,14 +1040,24 @@ fn sections(app: &App) -> Vec<Section> {
                     .show_ui(ui, |ui| match source {
                         crate::settings::TtsSource::Local => {
                             for option in crate::tts::LOCAL_VOICES {
-                                if theme_option(ui, &palette, option.label, option.key == voice) {
+                                if theme_option(
+                                    ui,
+                                    &palette,
+                                    &option.label(locale),
+                                    option.key == voice,
+                                ) {
                                     app.actions.push(Action::SetTtsVoice(option.key.to_owned()));
                                 }
                             }
                         }
                         crate::settings::TtsSource::Remote => {
                             for option in crate::tts::REMOTE_VOICES {
-                                if theme_option(ui, &palette, option.label, option.name == voice) {
+                                if theme_option(
+                                    ui,
+                                    &palette,
+                                    &option.label(locale),
+                                    option.name == voice,
+                                ) {
                                     app.actions
                                         .push(Action::SetTtsVoice(option.name.to_owned()));
                                 }
@@ -1225,7 +1235,13 @@ fn tts_voice_models(ui: &mut egui::Ui, app: &mut App) {
                 };
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 3.0, dot);
-                ui.label(voice.label);
+                ui.label(voice.name);
+                theme::text(
+                    ui,
+                    crate::i18n::gettext(locale, voice.description),
+                    theme::regular(11.5),
+                    palette.secondary,
+                );
                 theme::text(ui, voice.size, theme::regular(11.5), palette.secondary);
                 if let Some(DownloadState::Downloading { received, total }) = &progress {
                     let fraction = total

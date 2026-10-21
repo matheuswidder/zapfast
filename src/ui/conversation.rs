@@ -2238,11 +2238,11 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(8.0);
                 let selected = match source {
                     crate::settings::TtsSource::Local => crate::tts::local_voice_by_key(&voice)
-                        .map(|found| found.label)
-                        .unwrap_or(crate::tts::LOCAL_VOICES[0].label),
+                        .map(|found| found.label(locale))
+                        .unwrap_or_else(|| crate::tts::LOCAL_VOICES[0].label(locale)),
                     crate::settings::TtsSource::Remote => crate::tts::remote_voice_by_name(&voice)
-                        .map(|found| found.label)
-                        .unwrap_or(crate::tts::REMOTE_VOICES[0].label),
+                        .map(|found| found.label(locale))
+                        .unwrap_or_else(|| crate::tts::REMOTE_VOICES[0].label(locale)),
                 };
                 let response = egui::ComboBox::from_id_salt("tts-voice")
                     .selected_text(selected)
@@ -2250,14 +2250,24 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                     .show_ui(ui, |ui| match source {
                         crate::settings::TtsSource::Local => {
                             for option in crate::tts::LOCAL_VOICES {
-                                if theme_option(ui, &palette, option.label, option.key == voice) {
+                                if theme_option(
+                                    ui,
+                                    &palette,
+                                    &option.label(locale),
+                                    option.key == voice,
+                                ) {
                                     app.actions.push(Action::SetTtsVoice(option.key.to_owned()));
                                 }
                             }
                         }
                         crate::settings::TtsSource::Remote => {
                             for option in crate::tts::REMOTE_VOICES {
-                                if theme_option(ui, &palette, option.label, option.name == voice) {
+                                if theme_option(
+                                    ui,
+                                    &palette,
+                                    &option.label(locale),
+                                    option.name == voice,
+                                ) {
                                     app.actions
                                         .push(Action::SetTtsVoice(option.name.to_owned()));
                                 }

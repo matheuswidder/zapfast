@@ -3062,3 +3062,23 @@ msgstr "O motor de fala que as vozes locais usam. Nada do que ele fala sai deste
 #: src/ui/settings.rs
 msgid "Installed"
 msgstr "Instalado"
+
+#: src/tts.rs
+msgid "a news anchor's voice"
+msgstr "voz de locutor de rádio"
+
+#: src/tts.rs
+msgid "a man's voice"
+msgstr "voz masculina"
+
+#: src/tts.rs
+msgid "a woman's voice"
+msgstr "voz feminina"
+
+#: src/tts.rs
+msgid "a woman's voice, the classic one"
+msgstr "voz feminina, a clássica"
+
+#: src/tts.rs
+msgid "a lighter man's voice"
+msgstr "voz masculina mais leve"

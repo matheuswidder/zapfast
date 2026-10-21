@@ -315,10 +315,10 @@ Portuguese voices.
 
 | Voice | Size | Notes |
 | --- | --- | --- |
-| Faber | 63 MB | A male news anchor's voice |
-| Jeff | 63 MB | Male |
-| Cadu | 63 MB | Male |
-| Edresson | 63 MB | Male, lighter than the others |
+| Faber | 63 MB | A news anchor's voice |
+| Jeff | 63 MB | A man's voice |
+| Cadu | 63 MB | A man's voice |
+| Edresson | 63 MB | A lighter man's voice |
 
 **A service** sends the text to a service that speaks it and answers with an
 audio file. The **Service address** is the URL to send it to, and the
