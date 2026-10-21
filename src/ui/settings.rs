@@ -17,6 +17,13 @@ use super::widgets;
 /// The settings search field, which Ctrl+F focuses on this page.
 pub const SEARCH_ID: &str = "settings-search";
 
+/// The width of the column of actions at the end of a model's row.
+const MODEL_ACTIONS_WIDTH: f32 = 120.0;
+
+/// The width of the column of sizes beside it. The columns are the same
+/// width on every row, so the sizes of a list line up down the page.
+const MODEL_SIZE_WIDTH: f32 = 60.0;
+
 /// A settings string with its English source, so the search finds a
 /// translated setting by either wording.
 #[derive(Clone, Debug, Default)]
@@ -881,6 +888,7 @@ fn sections(app: &App) -> Vec<Section> {
             translated(locale, "Portuguese, or let the model detect the language."),
             move |ui, app| {
                 use crate::i18n::gettext;
+                let palette = app.palette;
                 let selected = app.settings.transcription_portuguese;
                 let response = egui::ComboBox::from_id_salt("transcription_language")
                     .selected_text(if selected {
@@ -888,21 +896,22 @@ fn sections(app: &App) -> Vec<Section> {
                     } else {
                         gettext(locale, "Detect language")
                     })
-                    .width(200.0_f32.min(ui.available_width()))
+                    .width(220.0_f32.min(ui.available_width()))
                     .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(selected, gettext(locale, "Portuguese").as_ref())
-                            .clicked()
-                        {
+                        if theme_option(
+                            ui,
+                            &palette,
+                            gettext(locale, "Portuguese").as_ref(),
+                            selected,
+                        ) {
                             app.actions.push(Action::SetTranscriptionPortuguese(true));
                         }
-                        if ui
-                            .selectable_label(
-                                !selected,
-                                gettext(locale, "Detect language").as_ref(),
-                            )
-                            .clicked()
-                        {
+                        if theme_option(
+                            ui,
+                            &palette,
+                            gettext(locale, "Detect language").as_ref(),
+                            !selected,
+                        ) {
                             app.actions.push(Action::SetTranscriptionPortuguese(false));
                         }
                     });
@@ -1003,7 +1012,7 @@ fn sections(app: &App) -> Vec<Section> {
                 let selected = app.settings.tts_source;
                 let response = egui::ComboBox::from_id_salt("tts_source")
                     .selected_text(selected.label(locale))
-                    .width(200.0_f32.min(ui.available_width()))
+                    .width(220.0_f32.min(ui.available_width()))
                     .show_ui(ui, |ui| {
                         for choice in crate::settings::TtsSource::ALL {
                             if theme_option(
@@ -1210,6 +1219,32 @@ fn model_hint(
     }
 }
 
+/// The end of a model's row: the actions in a column of their own, and
+/// the size that stands beside them. Both columns keep the same width on
+/// every row, so the sizes of a list line up down the page.
+fn row_end(ui: &mut egui::Ui, palette: &Palette, size: &str, actions: impl FnOnce(&mut egui::Ui)) {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(MODEL_ACTIONS_WIDTH, 28.0), Sense::hover());
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(Layout::right_to_left(Align::Center)),
+            actions,
+        );
+        ui.add_space(12.0);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(size.to_owned(), theme::regular(11.5), palette.secondary);
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(MODEL_SIZE_WIDTH, galley.size().y), Sense::hover());
+        ui.painter().galley(
+            pos2(rect.right() - galley.size().x, rect.min.y),
+            galley,
+            palette.secondary,
+        );
+    });
+}
+
 /// The local voices of the TTS extension: sizes, download buttons with
 /// progress, and which one the extension speaks with.
 fn tts_voice_models(ui: &mut egui::Ui, app: &mut App) {
@@ -1242,7 +1277,6 @@ fn tts_voice_models(ui: &mut egui::Ui, app: &mut App) {
                     theme::regular(11.5),
                     palette.secondary,
                 );
-                theme::text(ui, voice.size, theme::regular(11.5), palette.secondary);
                 if let Some(DownloadState::Downloading { received, total }) = &progress {
                     let fraction = total
                         .filter(|total| *total > 0)
@@ -1256,7 +1290,7 @@ fn tts_voice_models(ui: &mut egui::Ui, app: &mut App) {
                             .corner_radius(7.0),
                     );
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                row_end(ui, &palette, voice.size, |ui| {
                     if active == voice.key {
                         theme::soft_button(ui, &palette, None, &gettext(locale, "Active"), true);
                     } else if downloaded {
@@ -1456,7 +1490,6 @@ fn transcription_models(ui: &mut egui::Ui, app: &mut App) {
                             palette.accent,
                         );
                     }
-                    theme::text(ui, model.size, theme::regular(11.5), palette.secondary);
                     if let Some(DownloadState::Downloading { received, total }) = &progress {
                         let fraction = total
                             .filter(|total| *total > 0)
@@ -1471,7 +1504,7 @@ fn transcription_models(ui: &mut egui::Ui, app: &mut App) {
                         );
                     }
                     // Every action sits in the same column at the row's end.
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    row_end(ui, &palette, model.size, |ui| {
                         if active == Some(model.key) {
                             theme::soft_button(
                                 ui,

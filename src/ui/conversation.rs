@@ -9936,7 +9936,7 @@ fn voice_player(
             crate::transcription::TranscribeState::Done(text) => {
                 ui.add_space(6.0);
                 ui.separator();
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 // Stay inside the player's width. A wrapping label asks for
                 // the widest line it could draw, which would stretch the bubble.
                 let wrap = width.max(0.0);
@@ -9945,6 +9945,9 @@ fn voice_player(
                         .layout(text.clone(), theme::regular(13.0), palette.text, wrap);
                 let (rect, _) = ui.allocate_exact_size(vec2(wrap, galley.size().y), Sense::hover());
                 ui.painter().galley(rect.min, galley, palette.text);
+                // The transcript and the row under it are two things, and
+                // a little air tells them apart.
+                ui.add_space(4.0);
                 // Copy and the local note share the last line with the time.
                 // The row spans the bubble, so an outgoing bubble (which lays
                 // out from the right) still starts at the left, and the time's
@@ -9985,7 +9988,7 @@ fn voice_player(
                 if response.clicked() {
                     actions.push(Action::CopyText(text.clone()));
                 }
-                let note_at = pos2(copy.right() + 2.0, row.center().y - galley.size().y / 2.0);
+                let note_at = pos2(copy.right() + 6.0, row.center().y - galley.size().y / 2.0);
                 let note_width = (row.right() - time - note_at.x).max(0.0);
                 if galley.size().x <= note_width {
                     ui.painter().galley(note_at, galley, palette.secondary);
@@ -9998,15 +10001,37 @@ fn voice_player(
             crate::transcription::TranscribeState::Queued
             | crate::transcription::TranscribeState::Running => {
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    theme::spinner(ui, 14.0, palette.accent);
-                    theme::text(
-                        ui,
-                        crate::i18n::gettext(locale, "Transcribing"),
-                        theme::regular(12.0),
-                        palette.secondary,
-                    );
-                });
+                // The time leaves the player's line for this one, as it
+                // does under a finished transcript: the bubble ends with
+                // the time and the ticks, and the state sits beside them.
+                let time = footer_width(
+                    ui,
+                    message,
+                    view.starred
+                        .is_some_and(|stars| stars.contains(&message.id)),
+                    view.pins.is_some_and(|pins| pins.contains(&message.id)),
+                ) + 10.0;
+                let (row, _) = ui.allocate_exact_size(vec2(width.max(0.0), 22.0), Sense::hover());
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(row)
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.add_space(2.0);
+                        theme::spinner(ui, 14.0, palette.accent);
+                        ui.add_space(4.0);
+                        theme::text(
+                            ui,
+                            crate::i18n::gettext(locale, "Transcribing"),
+                            theme::regular(11.5),
+                            palette.text,
+                        );
+                    },
+                );
+                footer_slot = Some(Rect::from_min_max(
+                    pos2(row.right() - time, row.bottom() - 15.0),
+                    row.right_bottom(),
+                ));
             }
             crate::transcription::TranscribeState::Failed(_) => {
                 ui.add_space(6.0);
