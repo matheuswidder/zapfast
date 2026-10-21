@@ -250,6 +250,19 @@ aceita MP3 e WAV — por isso a extensão não acrescenta nenhuma dependência
 nova de decodificação. `tar` e `flate2` entraram só para descompactar o
 pacote do Piper no Linux e no macOS.
 
+**O texto tem teto de 1.900 caracteres** (`tts::MAX_CHARS`), o `char_limit`
+do egui, que recusa o que passa do limite em vez de cortar. Medido em
+21/10/2026 no mesmo texto de 617 caracteres: o Piper fala 34,2 s (18,0
+caracteres por segundo) e o Edge 37,2 s (16,6). O limite dá um pouco menos
+de dois minutos nas duas vozes. A caixa rola dentro de 5 linhas em vez de
+crescer: o `TextEdit` do egui não tem altura máxima, e uma caixa alta demais
+empurra o painel do compositor para fora da janela.
+
+**Um `with_layout` sozinho estica a linha.** Num fluxo vertical, o
+`ui.with_layout(Layout::right_to_left(...))` sem um `ui.horizontal` em volta
+cresce até a altura restante do pai. Envolva sempre em `ui.horizontal`, como
+o resto do arquivo faz.
+
 Modelos baixados em `C:\Users\teco_\zapfast-turbo-test\` (2,2 GB — pode apagar).
 
 ## Capturas

@@ -15866,6 +15866,48 @@ mod tests {
         );
     }
 
+    /// The speech panel's text box scrolls instead of growing, so a long
+    /// message cannot push the panel past the window and hide the buttons
+    /// that make the speech.
+    #[test]
+    fn a_long_message_does_not_grow_the_speech_panel() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("speaking"));
+        let set_text = |app: &mut App, text: String| {
+            if let Some(draft) = app.tts.as_mut() {
+                draft.text = text;
+            }
+        };
+        let composer = |ctx: &egui::Context| {
+            ctx.data(|data| {
+                data.get_temp::<egui::Rect>(crate::ui::conversation::composer_pill_id())
+            })
+            .expect("the composer")
+        };
+        // A message as long as the panel allows.
+        set_text(&mut app, "A".repeat(crate::tts::MAX_CHARS));
+        for _ in 0..4 {
+            frame_sized(&mut app, &ctx, 780.0, Vec::new());
+        }
+        let first = composer(&ctx);
+        // One far longer than the panel allows.
+        set_text(&mut app, "A".repeat(crate::tts::MAX_CHARS * 4));
+        for _ in 0..4 {
+            frame_sized(&mut app, &ctx, 780.0, Vec::new());
+        }
+        let second = composer(&ctx);
+        assert!(
+            (first.top() - second.top()).abs() < 1.0,
+            "the panel grew with the text: {first:?} then {second:?}"
+        );
+        assert!(
+            second.bottom() <= 780.5,
+            "the composer left the window: {second:?}"
+        );
+    }
+
     /// The emoji and @mention suggestion lists sit on the composer as the
     /// strips do: as wide as it, and a strip's gap above it.
     #[test]

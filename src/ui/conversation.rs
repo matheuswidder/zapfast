@@ -2171,6 +2171,12 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
         let chat = draft.chat.clone();
         let text = draft.text.clone();
         let ready = draft.samples.is_some();
+        // The speech that was made, and how long it is. The estimate on
+        // the text is a guess; this is the truth.
+        let length = draft
+            .samples
+            .as_ref()
+            .map(|samples| crate::util::duration((samples.len() as u32) / crate::voice::RATE));
         let working = draft.working;
         let error = draft.error.clone();
         let source = app.settings.tts_source;
@@ -2201,20 +2207,55 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                 });
             });
             ui.add_space(6.0);
-            egui::TextEdit::multiline(&mut draft.text)
-                .id(egui::Id::new(("tts-text", &draft.chat)))
-                .desired_rows(3)
-                .hint_text(
-                    egui::RichText::new(
-                        crate::i18n::gettext(locale, "Type what to say").into_owned(),
-                    )
-                    .color(palette.dim)
-                    .font(theme::regular(BODY_SIZE)),
-                )
-                .font(theme::regular(BODY_SIZE))
-                .text_color(palette.text)
-                .frame(Frame::NONE)
-                .show(ui);
+            // The box scrolls instead of growing. A text edit has no
+            // maximum height, so a long message would push the panel past
+            // the window and hide the very buttons that make the speech.
+            let line_height = ui
+                .painter()
+                .layout_no_wrap("x".to_owned(), theme::regular(BODY_SIZE), palette.text)
+                .size()
+                .y;
+            egui::ScrollArea::vertical()
+                .id_salt(("tts-text-scroll", &draft.chat))
+                .max_height(line_height * 5.0)
+                .min_scrolled_height(line_height * 3.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    egui::TextEdit::multiline(&mut draft.text)
+                        .id(egui::Id::new(("tts-text", &draft.chat)))
+                        .desired_rows(3)
+                        // Past this the speech is longer than two
+                        // minutes, and the box is longer than the panel
+                        // can show.
+                        .char_limit(crate::tts::MAX_CHARS)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(
+                            egui::RichText::new(
+                                crate::i18n::gettext(locale, "Type what to say").into_owned(),
+                            )
+                            .color(palette.dim)
+                            .font(theme::regular(BODY_SIZE)),
+                        )
+                        .font(theme::regular(BODY_SIZE))
+                        .text_color(palette.text)
+                        .frame(Frame::NONE)
+                        .show(ui);
+                });
+            ui.add_space(4.0);
+            // How much was written, and how long it will take to say it.
+            let counter = crate::i18n::gettext(locale, "{} of {} characters, about {}")
+                .replacen("{}", &draft.text.chars().count().to_string(), 1)
+                .replacen("{}", &crate::tts::MAX_CHARS.to_string(), 1)
+                .replacen(
+                    "{}",
+                    &crate::util::duration(crate::tts::estimate_seconds(&draft.text)),
+                    1,
+                );
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    theme::text(ui, counter, theme::regular(11.5), palette.dim);
+                });
+            });
             ui.add_space(8.0);
             // The voice depends on where the speech comes from, so the two
             // pickers travel together.
@@ -2299,21 +2340,31 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
             }
             ui.horizontal(|ui| {
+                // One button for making the speech, and one action in
+                // front: making it while there is none, sending it once
+                // there is.
                 let generate = theme::pill_button(
                     ui,
                     &palette,
-                    &crate::i18n::gettext(locale, "Generate"),
-                    true,
+                    &if ready {
+                        crate::i18n::gettext(locale, "Say it again")
+                    } else {
+                        crate::i18n::gettext(locale, "Generate")
+                    },
+                    !ready,
                 );
                 if generate.clicked() && !text.trim().is_empty() {
                     speak = true;
                 }
                 if working {
+                    ui.add_space(6.0);
+                    theme::spinner(ui, 13.0, palette.accent);
+                    ui.add_space(4.0);
                     theme::text(
                         ui,
                         crate::i18n::gettext(locale, "Speaking...").into_owned(),
                         theme::regular(12.5),
-                        palette.dim,
+                        palette.secondary,
                     );
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2327,15 +2378,10 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                         if send_button.clicked() {
                             send = true;
                         }
-                        let again = theme::soft_button(
-                            ui,
-                            &palette,
-                            None,
-                            &crate::i18n::gettext(locale, "Say it again"),
-                            false,
-                        );
-                        if again.clicked() {
-                            speak = true;
+                        ui.add_space(4.0);
+                        // The time belongs to the player, beside it.
+                        if let Some(length) = &length {
+                            theme::text(ui, length.clone(), theme::regular(11.5), palette.dim);
                         }
                         let play_button = theme::icon_button(
                             ui,
@@ -2348,12 +2394,13 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                         if play_button.clicked() {
                             play = true;
                         }
+                        ui.add_space(8.0);
                         let discard_button = theme::icon_button(
                             ui,
                             Icon::Trash,
                             16.0,
                             palette.secondary,
-                            palette.text,
+                            palette.danger,
                             &crate::i18n::gettext(locale, "Discard voice message"),
                         );
                         if discard_button.clicked() {

@@ -2865,6 +2865,10 @@ msgid "Transcription model"
 msgstr "Modelo de transcrição"
 
 #: src/ui/settings.rs
+msgid "Transcription runs on this computer's processor."
+msgstr "A transcrição roda no processador deste computador."
+
+#: src/ui/settings.rs
 msgid "Download"
 msgstr "Baixar"
 
@@ -2974,6 +2978,10 @@ msgstr "Falar uma mensagem"
 #: src/ui/conversation.rs
 msgid "Type what to say"
 msgstr "Digite o que dizer"
+
+#: src/ui/conversation.rs
+msgid "{} of {} characters, about {}"
+msgstr "{} de {} caracteres, cerca de {}"
 
 #: src/ui/conversation.rs
 msgid "Generate"

@@ -305,6 +305,11 @@ Until then it can be edited and said again as many times as wanted, and
 thrown away for nothing. The message that goes out is a voice message of the
 chat the panel was opened in, exactly like a recording.
 
+The field under the title takes 1,900 characters at most, about two minutes
+of speech, and the panel counts them as they are written along with the
+length of the speech they will make. Past the limit the field stops taking
+more, and a long message scrolls inside it.
+
 **Where the speech comes from** picks between two sources.
 
 **On this computer** runs [Piper](https://github.com/rhasspy/piper) with a

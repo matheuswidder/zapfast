@@ -456,6 +456,11 @@ away with the delete button or closed without sending. The message that goes
 out is a voice message of the chat the panel was opened in, exactly like a
 recording from the microphone.
 
+Under the field the panel counts the characters and says how long the speech
+will take, roughly. The field takes 1,900 characters at most, which is about
+two minutes of speech; past that it stops taking more. A long message scrolls
+inside the field instead of pushing the panel away.
+
 **Where the speech comes from**, in the same settings, picks between a voice
 that runs on this computer and a service that speaks the text over the
 network. The local one is [Piper](https://github.com/rhasspy/piper) with a

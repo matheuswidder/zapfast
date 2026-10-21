@@ -155,6 +155,22 @@ pub const REMOTE_VOICES: [RemoteVoice; 4] = [
     },
 ];
 
+/// The most characters a message may hold. Measured against both sources
+/// on the same text: the local voice speaks at 18 characters a second and
+/// the service at 16.6, so this is a shade under two minutes of speech.
+pub const MAX_CHARS: usize = 1_900;
+
+/// How fast the voices speak, in characters a second. The slower of the
+/// two, so the estimate never promises less speech than the audio holds.
+pub const CHARS_PER_SECOND: f32 = 16.5;
+
+/// How long the text will take to speak, roughly. The audio the voice
+/// makes is the truth; this only tells the writer what to expect.
+pub fn estimate_seconds(text: &str) -> u32 {
+    let characters = text.trim().chars().count();
+    (characters as f32 / CHARS_PER_SECOND).round() as u32
+}
+
 /// The service the remote source talks to unless the settings say
 /// otherwise. It speaks the OpenAI audio API, the same one the radialista
 /// agent uses.
@@ -700,6 +716,20 @@ fn speak_remote(request: &Request) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The limit and the estimate agree with the voices: the text the
+    /// panel accepts is about two minutes of speech, and the estimate says
+    /// so.
+    #[test]
+    fn the_limit_is_about_two_minutes_of_speech() {
+        let seconds = estimate_seconds(&"A".repeat(MAX_CHARS));
+        assert!(
+            (110..=125).contains(&seconds),
+            "{MAX_CHARS} characters are {seconds} seconds of speech"
+        );
+        assert_eq!(estimate_seconds(""), 0);
+        assert_eq!(estimate_seconds("   \n  "), 0);
+    }
 
     #[test]
     fn the_local_voices_name_their_own_files() {
