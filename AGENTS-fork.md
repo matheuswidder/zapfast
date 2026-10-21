@@ -258,6 +258,14 @@ de dois minutos nas duas vozes. A caixa rola dentro de 5 linhas em vez de
 crescer: o `TextEdit` do egui não tem altura máxima, e uma caixa alta demais
 empurra o painel do compositor para fora da janela.
 
+**Quanto tempo cada voz leva**, medido no proxy em 21/10/2026: o texto
+cheio de 1.900 caracteres vira 115,3 s de áudio em 7,5 s de serviço, e o
+Piper local faz os mesmos 115 s em cerca de 9 s (fator tempo-real 0,078).
+Para texto curto o serviço responde em 0,7 s. A chamada remota tem timeout
+de 60 s; uma vez ele demorou 76,8 s para um texto curto e devolveu o áudio
+mesmo assim, então o timeout não é garantia e o painel mostra o estado
+"falando" enquanto espera.
+
 **Um `with_layout` sozinho estica a linha.** Num fluxo vertical, o
 `ui.with_layout(Layout::right_to_left(...))` sem um `ui.horizontal` em volta
 cresce até a altura restante do pai. Envolva sempre em `ui.horizontal`, como
