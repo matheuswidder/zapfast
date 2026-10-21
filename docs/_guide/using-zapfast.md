@@ -414,12 +414,18 @@ Voice messages play in the chat with a seekable waveform; audio files show a
 music icon and a seek bar instead. The chip beside the waveform or seek bar
 cycles the playback speed between 1x, 1.5x, and 2x. Right-click the
 message for every speed, including 1.25x and 1.75x. The choice is remembered
-for later messages. When a voice message ends, playback carries on through the
+for later messages. To give one chat its own speed, right-click the chat in the
+list and pick **Voice message speed**. That chat then always plays at its own
+speed, and the chip there changes only that chat. Pick **Default** to follow
+the speed of the other chats again. When a voice message ends, playback carries on through the
 voice messages right after it that you have not heard yet, as on the phone;
 any other message ends the run. The speaker's pitch stays the same at every
 speed. The first play sends
 a played receipt. When the composer is empty, the send button becomes a
-microphone. Press Enter or the send button to send the recording, or Escape or
+microphone. The light beside the time turns red, and the time starts, once the
+microphone delivers sound: one the system had put to sleep can take a moment to
+wake, and anything said before then is not recorded. Press Enter or the send
+button to send the recording, or Escape or
 the delete button to discard it. ZapFast raises the volume of quiet recordings.
 Starting a reply before recording includes the quoted message.
 
@@ -482,33 +488,26 @@ call screen says so. Cameras come through Video4Linux on Linux, AVFoundation on
 macOS (which asks once for permission), and Media Foundation on Windows. The
 Flatpak is allowed its devices for this, since Flatpak has no narrower
 permission for cameras.
-Calls use your platform's own audio (PipeWire or ALSA on Linux, Core Audio on
+Calls use your platform's own audio (PipeWire, PulseAudio or ALSA on Linux, Core Audio on
 macOS, WASAPI on Windows), with no echo cancellation of their own: use
 headphones, or your system's echo cancellation, when the speaker is loud.
 
 ### Group calls
 
-A group call rings under the group's name and picture and says who is calling
-("Group voice call from Jonas"), with the faces of those already on it. Once
-you answer, everyone on the call has a tile with their picture and name, and
-so do you, as **You** (with a red microphone while you are muted); someone who
-was asked but has not joined yet reads **Invited**, and the tiles follow people
-as they join and leave. Mute, the device pickers and hang up work as in
-any call, and hanging up leaves the call to the others. In a group's video
-call each member's camera fills their tile, and yours fills your own tile;
-someone whose camera is off keeps their photo. The camera
-button turns yours off and on. A group's voice call stays a voice call. ZapFast does not start group calls: WhatsApp refuses them
-from linked devices, so a group's header has no call button, and a group call is
-started on the phone.
+ZapFast can't take part in group calls yet. A group's header has no call
+buttons, and a group call is started and answered on your phone.
 
-A call link in a message (`call.whatsapp.com/voice/…` or `/video/…`) joins
-that call here rather than opening the browser. The call screen says
-**Connecting…** until the call lets you in, which can take a while when its
-creator admits people one by one, then shows everyone on it as in a group call.
-Hanging up while you wait stops the join. A call joined through a link belongs
-to no chat: it is not filed in one, and shows on the Calls page as **Call
-link** with a link sign for a picture. That row only records the call; there
-is no chat to open from it and no one to call back.
+When someone calls one of your groups, ZapFast does not ring or show the call
+screen. It shows a notification, and a notice in the window while it is open,
+saying who is calling which group: "Jonas is calling Rust Berlin. ZapFast
+can't join group calls yet: answer on your phone." ZapFast sends WhatsApp
+nothing about the call, so your phone keeps ringing and you can answer there.
+A muted, archived or locked group's call stays as quiet as its messages. The
+call is still filed in the group's history when it ends.
+
+A call link in a message (`call.whatsapp.com/voice/…` or `/video/…`) is not
+joined here either: clicking it says ZapFast can't join group calls yet, so
+open the link on your phone.
 
 One call at a time: a call to another of your numbers while one is up is
 declined there. With several numbers linked, a call to a number that is not on
@@ -742,12 +741,16 @@ chat**, and the button beside it (`Ctrl+B`), which hides the list: the chats'
 avatars then fill the rail between its top and bottom buttons. Unread chats
 show their badge, hovering names a chat, clicking opens it, and `Ctrl+B` or
 the button under **Starred** brings the full list back.
+In a short window, scroll the rail to reach its lower buttons. Tab and
+Shift+Tab bring the focused button into view, too.
 
 ## Notifications and the tray
 
-Closing the window keeps ZapFast linked in the tray. Click the tray icon or
-launch the app again to reopen it. To quit, use **Quit** in the tray menu, or
-**Quit** in the Dock icon's menu on macOS, or on Linux **Quit ZapFast** in the
+Closing the window keeps ZapFast linked in the tray. On macOS, click the menu
+bar icon to open its menu, then choose **Show or hide ZapFast** to reopen the
+window. On Linux and Windows, click the tray icon to reopen it. Launching the
+app again reopens the window on every platform. To quit, use **Quit** in the
+tray menu, or **Quit** in the Dock icon's menu on macOS, or on Linux **Quit ZapFast** in the
 launcher's right-click menu (KDE Plasma's task manager and application menu,
 GNOME's Dash). On every platform, `zapfast quit` in a terminal or a script quits
 the running copy the same way, and does nothing when none runs. A copy from
@@ -759,11 +762,15 @@ or Dash to Panel. Windows overlays a compact unread-message count on ZapFast's
 taskbar button while the window is open, using `99+` above 99. Windows must use
 its regular taskbar icon size for overlays to appear. The count
 does not count toasts remaining in Windows notification history. On macOS, the
-Dock icon shows the number of unread chats in a red badge. On Linux and
+Dock icon shows the number of unread chats in a red badge. The icon and
+badge stay with the app when its window is closed and reopened. A macOS
+source build run through Cargo uses ZapFast's icon too. Starting hidden
+lets you open the first window from the menu-bar menu. On Linux and
 Windows, notifications show the chat picture. On Linux, Windows, and macOS, a
-click on a notification opens the chat at the message it announced. On Linux
-and macOS this holds for the 32 most recent notifications (older ones only
-bring ZapFast forward), and reading a chat removes its notifications. macOS
+click on a notification opens the chat at the message it announced. This holds for the 32 most recent tracked notifications on all three platforms;
+older notifications remain in system history without a message click listener.
+Reading a chat removes its tracked notifications, including Windows toasts.
+Fastframe provides the same delivery and cancellation interface on each platform. macOS
 asks once for permission to show notifications. On Linux, a notification that arrives while the
 window is open behind others also highlights ZapFast in the taskbar until you
 switch to it. Muted chats do not send notifications, and

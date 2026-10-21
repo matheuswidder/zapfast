@@ -111,6 +111,12 @@ cargo run --features demo -- --demo
 demo pages, screenshots, and recorded tours, and
 [PACKAGING.md](PACKAGING.md) releases and packages.
 
+Native notifications use Fastframe on Linux, macOS and Windows. ZapFast keeps
+its account/chat routing, privacy settings, notification limits and sound
+previews. Clicks open the announced message; reading a chat withdraws its
+tracked notifications. OS permissions and notification presentation still apply.
+
+
 ## More native apps
 
 **Want Spotify just as fast and native?** [Spotifast](https://spotifast.rocks)

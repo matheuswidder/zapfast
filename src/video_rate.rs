@@ -68,13 +68,24 @@ const STEP_UP: [u32; 2] = [TIERS[0].max_bitrate, TIERS[1].max_bitrate];
 /// The rate below which the picture steps down from tier `n + 1` to `n`. Lower than the step up,
 /// so a rate hovering at a boundary does not flip the picture size back and forth.
 const STEP_DOWN: [u32; 2] = [450_000, 850_000];
-/// How long a rate has to hold before the picture grows.
+/// How long a rate has to hold before the picture grows, the first time.
 const STEP_UP_HOLD: Duration = Duration::from_secs(4);
+/// How soon after a step up a sign of congestion means the larger picture is what the path could
+/// not carry. A larger picture starts with its largest frame, a keyframe at the new size, so a
+/// path at its limit says so within a few reports.
+const STEP_UP_PROBATION: Duration = Duration::from_secs(10);
+/// The longest the hold before a step up grows to after steps up that failed.
+const MAX_STEP_UP_HOLD: Duration = Duration::from_secs(64);
 /// After a sign of congestion, how long before the rate may rise again.
 const CONGESTION_HOLD: Duration = Duration::from_secs(3);
 /// The rise for a clean report, and how often it may be applied.
 const RISE: f64 = 1.08;
 const RISE_EVERY: Duration = Duration::from_secs(1);
+/// Where a rate that met loss is remembered as the path's limit: a little under it.
+const LOSS_CEILING: f64 = 0.9;
+/// The rise past that limit: a slow probe, since the path lost video there not long ago. A real
+/// call climbed back to its old rate within ten seconds of each loss, and lost again there.
+const PROBE_RISE: f64 = 1.02;
 /// Reported loss above this is congestion; below `LOSS_CLEAN` the path is clean. Between the two
 /// the rate holds, since a few percent is what a healthy wireless link loses anyway.
 const LOSS_CONGESTED: f64 = 0.10;
@@ -85,6 +96,18 @@ const DROP_CUT: f64 = 0.7;
 const REMB_TTL: Duration = Duration::from_secs(10);
 /// Our own audio streams the reports can name; a call has one, a renumbered one two.
 const AUDIO_SSRC_MEMORY: usize = 4;
+/// Round trip above the call's shortest that means a queue is filling on the path. A path at its
+/// limit queues before it loses anything, and that queue is delay the peer sees: on a deep buffer,
+/// seconds of it with no loss reported at all.
+const QUEUE_DELAY: Duration = Duration::from_millis(250);
+/// Round trip above the shortest at which the rate stops rising, short of cutting it.
+const RISE_DELAY: Duration = Duration::from_millis(100);
+/// What one queue-delay reading costs the rate, and how often it may: a queue takes a while to
+/// drain once the rate is under what the path carries, so the next reports still show it.
+const DELAY_CUT: f64 = 0.85;
+const DELAY_CUT_EVERY: Duration = Duration::from_secs(1);
+/// Seconds between the NTP era (1900) and the Unix one.
+const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 
 /// What the capture thread reads between frames: the rate and the step, as the controller last
 /// set them. And the one thing it reports back: frames it could not hand to the engine.
@@ -165,8 +188,12 @@ pub enum Reason {
     Clean,
     /// The relay connection's send queue dropped video it could not take.
     SendDrops,
+    /// The camera's frames backed up on the way to the engine and some were let go.
+    CaptureDrops,
     /// The peer's own estimate of what it can receive.
     Estimate(u32),
+    /// The round trip stood this far above the call's shortest: a queue on the path.
+    Delay(Duration),
 }
 
 /// A move of the rate or the step, from one setting to the next.
@@ -183,10 +210,23 @@ pub struct RateControl {
     setting: Setting,
     /// When the rate first stood high enough for the next step up, while it still does.
     above_since: Option<Instant>,
+    /// How long the rate has to stand there: doubled each time a step up meets congestion within
+    /// its probation, so a path that cannot carry the larger picture is not offered it every few
+    /// seconds, each try costing a keyframe and a burst of loss.
+    step_up_hold: Duration,
+    /// When the picture last grew, while that step is still on probation.
+    stepped_up_at: Option<Instant>,
     congested_at: Option<Instant>,
     raised_at: Option<Instant>,
+    /// A little under the rate the peer last reported loss at: clean reports climb quickly up to
+    /// it and slowly past it.
+    loss_ceiling: Option<u32>,
     /// The peer's latest estimate of what it can receive, and when it said so.
     estimate: Option<(u32, Instant)>,
+    /// The shortest round trip of the call, the path with nothing queued, and the latest one.
+    round_trip_floor: Option<Duration>,
+    round_trip: Option<Duration>,
+    delay_cut_at: Option<Instant>,
     /// Our own audio SSRCs, learnt from reports that cover audio alone, so that a report covering
     /// both directions of media can be read for its video block alone.
     audio_ssrcs: Vec<u32>,
@@ -200,9 +240,15 @@ impl RateControl {
         Self {
             setting,
             above_since: None,
+            step_up_hold: STEP_UP_HOLD,
+            stepped_up_at: None,
             congested_at: None,
             raised_at: None,
+            loss_ceiling: None,
             estimate: None,
+            round_trip_floor: None,
+            round_trip: None,
+            delay_cut_at: None,
             audio_ssrcs: Vec::new(),
             share,
         }
@@ -257,12 +303,13 @@ impl RateControl {
         let loss = f64::from(fraction_lost) / 256.0;
         let before = self.setting;
         let reason = if loss > LOSS_CONGESTED {
-            self.congested_at = Some(now);
+            self.congested(now);
+            self.loss_ceiling = Some(scale(self.setting.bitrate, LOSS_CEILING).max(MIN_BITRATE));
             self.setting.bitrate = scale(self.setting.bitrate, 1.0 - loss / 2.0);
             Reason::Loss(loss)
         } else if loss < LOSS_CLEAN && self.may_rise(now) {
             self.raised_at = Some(now);
-            self.setting.bitrate = scale(self.setting.bitrate, RISE);
+            self.setting.bitrate = self.risen(self.setting.bitrate);
             Reason::Clean
         } else {
             return self.restep(now, before, Reason::Loss(loss));
@@ -270,12 +317,59 @@ impl RateControl {
         self.restep(now, before, reason)
     }
 
+    /// The latest round trip and the call's shortest, for the log.
+    pub fn round_trips(&self) -> (Option<Duration>, Option<Duration>) {
+        (self.round_trip, self.round_trip_floor)
+    }
+
+    /// A round trip measured from the peer's report on one of our sender reports.
+    ///
+    /// The queue a path builds when it is sent more than it carries shows first as delay, and only
+    /// once the queue overflows as loss; a deep buffer may hold seconds before it does. So a round
+    /// trip well above the call's shortest cuts the rate like loss would, and one somewhat above it
+    /// keeps the rate from rising.
+    pub fn on_round_trip(&mut self, round_trip: Duration, now: Instant) -> Option<Change> {
+        let floor = self
+            .round_trip_floor
+            .map_or(round_trip, |floor| floor.min(round_trip));
+        self.round_trip_floor = Some(floor);
+        self.round_trip = Some(round_trip);
+        let queued = round_trip.saturating_sub(floor);
+        if queued < RISE_DELAY {
+            return None;
+        }
+        let before = self.setting;
+        if queued < QUEUE_DELAY
+            || self
+                .delay_cut_at
+                .is_some_and(|at| now.duration_since(at) < DELAY_CUT_EVERY)
+        {
+            // Holding is enough here: the rate stays put until the queue drains.
+            self.congested_at = Some(now);
+            return None;
+        }
+        self.delay_cut_at = Some(now);
+        self.congested(now);
+        self.setting.bitrate = scale(self.setting.bitrate, DELAY_CUT);
+        self.restep(now, before, Reason::Delay(queued))
+    }
+
     /// The send queue dropped video it could not take: the path is carrying less than is sent.
     pub fn on_send_drops(&mut self, now: Instant) -> Option<Change> {
+        self.on_drops(now, Reason::SendDrops)
+    }
+
+    /// The camera's frames could not all be handed to the engine, which is behind for the same
+    /// reason.
+    pub fn on_capture_drops(&mut self, now: Instant) -> Option<Change> {
+        self.on_drops(now, Reason::CaptureDrops)
+    }
+
+    fn on_drops(&mut self, now: Instant, reason: Reason) -> Option<Change> {
         let before = self.setting;
-        self.congested_at = Some(now);
+        self.congested(now);
         self.setting.bitrate = scale(self.setting.bitrate, DROP_CUT);
-        self.restep(now, before, Reason::SendDrops)
+        self.restep(now, before, reason)
     }
 
     /// The peer's own estimate of what it can receive caps the rate while it is fresh.
@@ -283,6 +377,26 @@ impl RateControl {
         let before = self.setting;
         self.estimate = Some((bitrate, now));
         self.restep(now, before, Reason::Estimate(bitrate))
+    }
+
+    /// A sign of congestion: the rate holds off rising, and a step up still on probation failed.
+    fn congested(&mut self, now: Instant) {
+        self.congested_at = Some(now);
+        if let Some(at) = self.stepped_up_at.take()
+            && now.duration_since(at) < STEP_UP_PROBATION
+        {
+            self.step_up_hold = (self.step_up_hold * 2).min(MAX_STEP_UP_HOLD);
+        }
+    }
+
+    /// The rate after one clean report: up by [`RISE`] to the loss ceiling, by [`PROBE_RISE`] past
+    /// it.
+    fn risen(&self, bitrate: u32) -> u32 {
+        match self.loss_ceiling {
+            Some(ceiling) if bitrate >= ceiling => scale(bitrate, PROBE_RISE),
+            Some(ceiling) => scale(bitrate, RISE).min(ceiling.max(scale(bitrate, PROBE_RISE))),
+            None => scale(bitrate, RISE),
+        }
     }
 
     fn may_rise(&self, now: Instant) -> bool {
@@ -323,9 +437,10 @@ impl RateControl {
         if self.setting.tier + 1 < TIERS.len() && self.setting.bitrate >= STEP_UP[self.setting.tier]
         {
             let since = *self.above_since.get_or_insert(now);
-            if now.duration_since(since) >= STEP_UP_HOLD {
+            if now.duration_since(since) >= self.step_up_hold {
                 self.setting.tier += 1;
                 self.above_since = None;
+                self.stepped_up_at = Some(now);
             }
         } else {
             self.above_since = None;
@@ -349,6 +464,33 @@ fn scale(bitrate: u32, factor: f64) -> u32 {
         .clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
+/// The middle 32 bits of the NTP timestamp for `now`, the form RTCP's LSR field takes.
+pub fn ntp_middle(now: std::time::SystemTime) -> u32 {
+    let since = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = since.as_secs().wrapping_add(NTP_UNIX_OFFSET);
+    let fraction = (u64::from(since.subsec_nanos()) << 32) / 1_000_000_000;
+    (((seconds & 0xffff) << 16) | (fraction >> 16)) as u32
+}
+
+/// The round trip a report block measures (RFC 3550, 6.4.1): from when our sender report left,
+/// which its LSR names, to `now`, less the time the peer held it, which its DLSR names. All three
+/// in NTP's middle 32 bits, units of 1/65536 s. `None` before the peer has had a sender report, or
+/// when the clocks say the report came back before it left.
+pub fn round_trip(last_sender_report: u32, delay_since: u32, now: u32) -> Option<Duration> {
+    if last_sender_report == 0 {
+        return None;
+    }
+    let units = now
+        .wrapping_sub(last_sender_report)
+        .wrapping_sub(delay_since);
+    if units >= 0x8000_0000 {
+        return None;
+    }
+    Some(Duration::from_micros(u64::from(units) * 1_000_000 / 65_536))
+}
+
 /// A receiver estimate (RTCP PSFB "REMB", `draft-alvestrand-rmcat-remb`) from one feedback item's
 /// FCI, in bits per second.
 pub fn remb_bitrate(fci: &[u8]) -> Option<u32> {
@@ -359,6 +501,50 @@ pub fn remb_bitrate(fci: &[u8]) -> Option<u32> {
     let mantissa =
         (u64::from(fci[5] & 0x03) << 16) | (u64::from(*fci.get(6)?) << 8) | u64::from(*fci.get(7)?);
     Some(u32::try_from(mantissa << exponent.min(40)).unwrap_or(u32::MAX))
+}
+
+/// What the peer's feedback has asked of our video over the call, for the log.
+///
+/// Counted rather than acted on here: the engine answers keyframe requests on its own and the
+/// rate control reads the estimates. What these say is whether the peer recovers lost video by
+/// asking for packets again (NACK) or for a whole new picture (PLI, FIR), and whether anyone sends
+/// an estimate at all, which a freeze or a stuck rate cannot tell apart from the outside.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerFeedback {
+    /// Packets named in generic NACKs, the bitmask's included.
+    pub nacked_packets: u32,
+    pub picture_loss: u32,
+    pub full_intra: u32,
+    pub estimates: u32,
+    /// The latest estimate, in bits per second.
+    pub last_estimate: Option<u32>,
+}
+
+impl PeerFeedback {
+    /// One feedback message (RFC 4585): its RTCP packet type, FMT and FCI.
+    pub fn note(&mut self, packet_type: u8, fmt: u8, fci: &[u8]) {
+        const TRANSPORT_FEEDBACK: u8 = 205;
+        const PAYLOAD_FEEDBACK: u8 = 206;
+        match (packet_type, fmt) {
+            (TRANSPORT_FEEDBACK, 1) => {
+                for row in fci.as_chunks::<4>().0 {
+                    let following = u16::from_be_bytes([row[2], row[3]]);
+                    self.nacked_packets = self
+                        .nacked_packets
+                        .saturating_add(1 + following.count_ones());
+                }
+            }
+            (PAYLOAD_FEEDBACK, 1) => self.picture_loss = self.picture_loss.saturating_add(1),
+            (PAYLOAD_FEEDBACK, 4) => self.full_intra = self.full_intra.saturating_add(1),
+            (PAYLOAD_FEEDBACK, 15) => {
+                if let Some(bitrate) = remb_bitrate(fci) {
+                    self.estimates = self.estimates.saturating_add(1);
+                    self.last_estimate = Some(bitrate);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// How many camera frames to let go for each one sent, so the frames that are sent are evenly
@@ -382,16 +568,25 @@ pub fn decimation(camera_fps: u32, target_fps: u32) -> u32 {
         .unwrap_or(1)
 }
 
-/// The camera's real frame rate, measured over its last thirty frames.
+/// The camera's real frame rate, measured over windows of thirty frames.
 ///
 /// A driver reports the rate it was set to, and a camera does not always keep to it: many slow
 /// down in a dim room, and a capture card runs at whatever its HDMI source does. Thinning by a
 /// rate the camera is not keeping sends far fewer frames than intended, so the rate is measured,
 /// and a move of more than a sixth from what the thinning was planned for is reported once.
+///
+/// Only a move two windows in a row agree on. Frames are timed as they reach this thread, and
+/// while it is busy (a keyframe to encode, a new encoder to build) the driver's buffers fill and
+/// then hand over several frames at once: one window of a 50 fps capture card read 92 fps and
+/// another 75, and each reading rebuilt the encoder, which costs the peer a keyframe, only for the
+/// next to put it back. A camera that really changed its rate is still at the new one a window
+/// later; a backlog is not.
 #[derive(Debug)]
 pub struct Cadence {
     recent: std::collections::VecDeque<Instant>,
     basis: f64,
+    /// The last window's rate, while it stood apart from the basis.
+    pending: Option<f64>,
 }
 
 /// Frames over which the rate is measured: thirty intervals.
@@ -404,15 +599,13 @@ impl Cadence {
         Self {
             recent: std::collections::VecDeque::with_capacity(CADENCE_WINDOW),
             basis: planned_fps.max(1.0),
+            pending: None,
         }
     }
 
     /// One frame from the camera, taken at `at`. Returns the measured rate when it has moved far
     /// enough from the one planned for to plan again, which then becomes the new basis.
     pub fn observe(&mut self, at: Instant) -> Option<f64> {
-        if self.recent.len() == CADENCE_WINDOW {
-            self.recent.pop_front();
-        }
         self.recent.push_back(at);
         if self.recent.len() < CADENCE_WINDOW {
             return None;
@@ -422,17 +615,30 @@ impl Cadence {
             .back()?
             .saturating_duration_since(*self.recent.front()?)
             .as_secs_f64();
+        // The window's last frame opens the next one, so no interval goes unmeasured.
+        self.recent.drain(..CADENCE_WINDOW - 1);
         if span <= 0.0 {
             return None;
         }
         let measured = (CADENCE_WINDOW - 1) as f64 / span;
-        if (measured - self.basis).abs() / self.basis <= CADENCE_DRIFT {
-            return None;
+        if drifted(measured, self.basis) {
+            let confirmed = self
+                .pending
+                .replace(measured)
+                .filter(|previous| !drifted(measured, *previous))?;
+            self.pending = None;
+            self.basis = (confirmed + measured) / 2.0;
+            Some(self.basis)
+        } else {
+            self.pending = None;
+            None
         }
-        self.basis = measured;
-        self.recent.clear();
-        Some(measured)
     }
+}
+
+/// Whether `rate` is further than [`CADENCE_DRIFT`] from `from`.
+fn drifted(rate: f64, from: f64) -> bool {
+    (rate - from).abs() / from > CADENCE_DRIFT
 }
 
 /// Turns capture instants into evenly spaced RTP timestamps.
@@ -538,6 +744,105 @@ mod tests {
             None,
             "at most once a second"
         );
+    }
+
+    #[test]
+    fn after_loss_the_rate_climbs_quickly_to_under_where_it_was_lost_and_slowly_past_it() {
+        let (mut control, _) = control();
+        let mut now = Instant::now();
+        for _ in 0..40 {
+            now += Duration::from_secs(1);
+            control.on_loss(0, now);
+        }
+        let top = control.setting().bitrate;
+        assert_eq!(top, TIERS[2].max_bitrate, "a clean call reaches the top");
+        // The peer loses a quarter of it, as a real call did at 1.5 Mbit/s.
+        now += Duration::from_secs(1);
+        control.on_loss(64, now);
+        let ceiling = scale(top, LOSS_CEILING);
+        now += CONGESTION_HOLD;
+        let mut seconds = 0;
+        while control.setting().bitrate < ceiling {
+            now += Duration::from_secs(1);
+            seconds += 1;
+            control.on_loss(0, now);
+        }
+        assert!(seconds <= 5, "back near the limit in {seconds} s");
+        assert_eq!(
+            control.setting().bitrate,
+            ceiling,
+            "and not past it in one step"
+        );
+        now += Duration::from_secs(1);
+        let change = control.on_loss(0, now).expect("still rises");
+        assert_eq!(
+            change.to.bitrate,
+            scale(ceiling, PROBE_RISE),
+            "slowly past it"
+        );
+    }
+
+    #[test]
+    fn a_round_trip_is_read_from_lsr_and_dlsr() {
+        // RFC 3550's example: LSR 0xb705:2000, DLSR 5.25 s, arriving at 0xb710:8000.
+        let round_trip = round_trip(0xb705_2000, 0x0005_4000, 0xb710_8000);
+        assert_eq!(round_trip, Some(Duration::from_micros(6_125_000)));
+        assert_eq!(super::round_trip(0, 0, 0xb710_8000), None, "no report yet");
+        assert_eq!(
+            super::round_trip(0xb710_8000, 0x0001_0000, 0xb710_8000),
+            None,
+            "back before it left"
+        );
+    }
+
+    #[test]
+    fn the_ntp_middle_bits_count_from_1900() {
+        assert_eq!(ntp_middle(std::time::UNIX_EPOCH), 0x7e80_0000);
+        let half = std::time::UNIX_EPOCH + Duration::from_millis(1_500);
+        assert_eq!(ntp_middle(half), 0x7e81_8000);
+    }
+
+    #[test]
+    fn a_queue_on_the_path_cuts_the_rate_before_any_loss() {
+        let (mut control, _) = control();
+        let now = Instant::now();
+        let floor = Duration::from_millis(80);
+        assert_eq!(control.on_round_trip(floor, now), None);
+        assert_eq!(
+            control.on_round_trip(floor + Duration::from_millis(60), now),
+            None,
+            "a little delay is the path's own"
+        );
+        let change = control
+            .on_round_trip(floor + Duration::from_millis(400), now)
+            .expect("a queue cuts the rate");
+        assert_eq!(change.reason, Reason::Delay(Duration::from_millis(400)));
+        assert_eq!(change.to.bitrate, 595_000);
+        let later = now + Duration::from_millis(500);
+        assert_eq!(
+            control.on_round_trip(floor + Duration::from_millis(400), later),
+            None,
+            "at most once a second, while the queue drains"
+        );
+        assert!(
+            control
+                .on_round_trip(
+                    floor + Duration::from_millis(400),
+                    now + Duration::from_secs(1)
+                )
+                .is_some()
+        );
+        assert_eq!(control.round_trips().1, Some(floor));
+    }
+
+    #[test]
+    fn some_queue_delay_keeps_the_rate_from_rising() {
+        let (mut control, _) = control();
+        let now = Instant::now();
+        control.on_round_trip(Duration::from_millis(80), now);
+        assert_eq!(control.on_round_trip(Duration::from_millis(230), now), None);
+        assert_eq!(control.on_loss(0, now + Duration::from_secs(2)), None);
+        assert!(control.on_loss(0, now + Duration::from_secs(3)).is_some());
     }
 
     #[test]
@@ -669,17 +974,102 @@ mod tests {
                 None
             );
         }
-        // Said to run at 30, really running at 15: noticed once a window of frames is in.
+        // Said to run at 30, really running at 15: noticed once two windows of frames agree.
         let mut dim = Cadence::new(30.0);
-        let measured = (0..31u64)
-            .find_map(|frame| dim.observe(start + Duration::from_micros(frame * 66_667)))
-            .expect("the slowdown is noticed");
+        let noticed = (0..62u64).find_map(|frame| {
+            dim.observe(start + Duration::from_micros(frame * 66_667))
+                .map(|measured| (frame, measured))
+        });
+        let (frame, measured) = noticed.expect("the slowdown is noticed");
+        assert_eq!(frame, 60, "at the end of the second window");
         assert!((measured - 15.0).abs() < 0.1, "{measured}");
         // And not reported again while it stays there.
-        assert!((31..120u64).all(|frame| {
+        assert!((62..150u64).all(|frame| {
             dim.observe(start + Duration::from_micros(frame * 66_667))
                 .is_none()
         }));
+    }
+
+    /// A capture card at 50 fps whose frames reach the thread in bunches while it encodes a
+    /// keyframe: one window reads far faster than the camera runs, the next is back to normal.
+    #[test]
+    fn a_backlog_handed_over_at_once_does_not_replan_the_camera() {
+        let start = Instant::now();
+        let mut cadence = Cadence::new(50.0);
+        let mut at = start;
+        let mut frame = |gap_ms: u64| {
+            at += Duration::from_millis(gap_ms);
+            cadence.observe(at)
+        };
+        // A steady window, then one with fourteen frames delivered back to back (92 fps read).
+        for _ in 0..30 {
+            assert_eq!(frame(20), None);
+        }
+        for n in 0..30 {
+            assert_eq!(frame(if n < 14 { 1 } else { 20 }), None, "frame {n}");
+        }
+        // And steady again: nothing to replan, ever.
+        for _ in 0..90 {
+            assert_eq!(frame(20), None);
+        }
+    }
+
+    /// The step up that triggered the peer's 75% loss report: a larger picture offered again and
+    /// again would cost a keyframe and a burst of loss every few seconds.
+    #[test]
+    fn a_step_up_that_meets_congestion_waits_longer_before_the_next() {
+        let (mut control, _) = control();
+        let mut now = Instant::now();
+        let climb_to_720p = |control: &mut RateControl, now: &mut Instant| -> Duration {
+            let began = *now;
+            while control.setting().tier().name != "720p" {
+                *now += Duration::from_secs(1);
+                control.on_loss(0, *now);
+                assert!(*now - began < Duration::from_secs(300), "never stepped up");
+            }
+            *now - began
+        };
+        climb_to_720p(&mut control, &mut now);
+        // Within its probation the larger picture is lost: down it goes.
+        now += Duration::from_secs(3);
+        control.on_loss(192, now);
+        control.on_loss(192, now + Duration::from_secs(1));
+        now += Duration::from_secs(1);
+        assert_ne!(control.setting().tier().name, "720p");
+        // Climbing back takes the doubled hold at the top of 540p: eight seconds, not four.
+        let held_at_top = |control: &mut RateControl, now: &mut Instant| {
+            while control.setting().bitrate < TIERS[1].max_bitrate || control.setting().tier != 1 {
+                *now += Duration::from_secs(1);
+                control.on_loss(0, *now);
+            }
+            climb_to_720p(control, now)
+        };
+        let second = held_at_top(&mut control, &mut now);
+        assert!(second >= Duration::from_secs(8), "{second:?}");
+        // A step up that holds through its probation leaves the hold where it is.
+        now += STEP_UP_PROBATION;
+        control.on_loss(0, now);
+        control.on_loss(192, now + Duration::from_secs(1));
+        now += Duration::from_secs(2);
+        let third = held_at_top(&mut control, &mut now);
+        assert!(third < Duration::from_secs(16), "{third:?}");
+    }
+
+    #[test]
+    fn the_peers_feedback_is_counted_by_kind() {
+        let mut feedback = PeerFeedback::default();
+        // Two NACK rows: 1 + 2 packets, and 1 + 16.
+        feedback.note(205, 1, &[0, 1, 0, 0b11, 0, 40, 0xff, 0xff]);
+        feedback.note(206, 1, &[]);
+        feedback.note(206, 4, &[0, 0, 0, 9, 1, 0, 0, 0]);
+        feedback.note(206, 15, b"REMB\x01\x10\x30\xd4\x00\x00\x00\x09");
+        feedback.note(206, 15, b"NOPE");
+        feedback.note(201, 0, &[]);
+        assert_eq!(feedback.nacked_packets, 3 + 17);
+        assert_eq!(feedback.picture_loss, 1);
+        assert_eq!(feedback.full_intra, 1);
+        assert_eq!(feedback.estimates, 1);
+        assert_eq!(feedback.last_estimate, Some(200_000));
     }
 
     #[test]

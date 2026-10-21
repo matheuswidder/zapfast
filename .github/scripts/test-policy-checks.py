@@ -59,6 +59,34 @@ librespot-core = { git = "https://github.com/crmne/librespot", rev = "23fc42c" }
         self.assertEqual(flagged(found), ["Cargo.lock", "Cargo.toml"])
         self.assertIn("dennisgr7/librespot", found[1][1])
 
+    def test_approved_whatsapp_upstream_passes(self):
+        for url in (
+            "https://github.com/oxidezap/whatsapp-rust",
+            "https://github.com/oxidezap/whatsapp-rust.git",
+        ):
+            manifest = f'[dependencies]\nwhatsapp-rust = {{ git = "{url}", rev = "abc" }}\n'
+            lock = LOCK.format(source=f"git+{url}?rev=abc#abc").replace("librespot-core", "whatsapp-rust")
+            self.assertEqual(sources.problems({"Cargo.toml": manifest, "Cargo.lock": lock}), [])
+
+    def test_whatsapp_exception_does_not_allow_other_sources(self):
+        for url in (
+            "https://github.com/oxidezap/other-repository",
+            "https://github.com/oxidezap/whatsapp-rust-fork",
+            "https://github.com/other-owner/whatsapp-rust",
+            "https://github.com/oxidezap/whatsapp-rust/extra",
+            "https://github.com/oxidezap/%77hatsapp-rust",
+            "https://github.com/oxidezap/../other-owner/whatsapp-rust",
+            "https://gitlab.com/oxidezap/whatsapp-rust",
+            "http://github.com/oxidezap/whatsapp-rust",
+        ):
+            manifest = f'[dependencies]\nwhatsapp-rust = {{ git = "{url}" }}\n'
+            lock = LOCK.format(source=f"git+{url}?rev=abc#abc").replace("librespot-core", "whatsapp-rust")
+            self.assertEqual(
+                flagged(sources.problems({"Cargo.toml": manifest, "Cargo.lock": lock})),
+                ["Cargo.lock", "Cargo.toml"],
+                url,
+            )
+
     def test_lookalike_owners_and_paths_out_of_crmne_fail(self):
         for url in (
             "https://github.com/crmne-fork/librespot",

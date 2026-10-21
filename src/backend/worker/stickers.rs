@@ -1004,7 +1004,7 @@ impl Worker {
         tokio::spawn(async move {
             let result = async {
                 let zip = client
-                    .download(&pack)
+                    .download(&pack, Default::default())
                     .await
                     .map_err(|error| format!("Could not download the sticker pack: {error}"))?;
                 let stickers: Vec<(String, Vec<String>)> = pack

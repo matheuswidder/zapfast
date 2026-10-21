@@ -561,6 +561,9 @@ pub struct App {
     /// Chat whose voice messages carry on into the next unheard one when a
     /// clip ends. Leaving the chat, or playing a video, ends the run.
     voice_chat: Option<ChatId>,
+    /// Chat of the clip in the player, whose speed it plays at. Unlike
+    /// `voice_chat` it outlives a chat switch, as the clip keeps playing.
+    voice_clip_chat: Option<ChatId>,
     /// Next voice message of a run, playing once its download finishes, and
     /// when the download began. Media stays paused for a short while meanwhile.
     voice_wanted: Option<(ChatId, String, Instant)>,
@@ -768,6 +771,8 @@ pub struct App {
     pub call_member_textures: HashMap<String, CallTexture>,
     /// Whether ZapFast starts at login, when this installation supports it.
     pub start_with_system: Option<bool>,
+    /// The read or change of the login item running on its thread.
+    login_item: crate::autostart::LoginItem,
     /// Cross-thread window repaint handle.
     waker: Waker,
     tray: Option<fastframe_tray::Tray>,
@@ -1059,9 +1064,9 @@ const TRAY_SHOW: &str = "show";
 const TRAY_LOCK: &str = "lock";
 const TRAY_QUIT: &str = "quit";
 
-/// What a tray click asks for: a left click on Linux and macOS, or the menu's
-/// first entry, toggles the window; a left click on Windows and a Dock click
-/// on macOS show it.
+/// What a tray click asks for: a left click on Linux, or the menu's first
+/// entry, toggles the window; a left click on Windows and a Dock click on
+/// macOS show it. Clicking the macOS menu-bar icon opens its menu.
 fn tray_action(event: fastframe_tray::Event, window_hidden: bool) -> Option<Action> {
     use fastframe_tray::Event;
     Some(match event {
@@ -1090,8 +1095,6 @@ fn tray_config(lockable: bool) -> fastframe_tray::Config {
         // The tray icon is the app icon, so hosts that draw only named icons
         // may use the installed one.
         themed_icon: true,
-        // A left click on macOS toggles the window, as on Linux.
-        menu_on_click: false,
         menu: vec![
             MenuItem::action(TRAY_SHOW, "Show or hide ZapFast"),
             MenuItem::action(TRAY_LOCK, "Lock ZapFast").visible(lockable),
@@ -1160,7 +1163,9 @@ impl App {
         let mut app = Self::with_accounts(dirs, settings, roster, accounts, active, waker.clone());
         app.pauses_media = true;
         app.call_tones = crate::call_tones::Tones::new(true);
-        app.badge = Some(Default::default());
+        app.badge = Some(crate::notify::Badge::new(fastframe_desktop::desktop_entry(
+            "zapfast",
+        )));
         app.custom_themes
             .enable_desktop_themes(crate::theme::DESKTOP_THEMES);
         app.load_custom_themes();
@@ -1202,9 +1207,8 @@ impl App {
                 app.settings.keep_chats_archived,
             ));
         }
-        if crate::autostart::supported() {
-            app.start_with_system = Some(crate::autostart::enabled());
-        }
+        let login_waker = waker.clone();
+        app.login_item.read(move || login_waker.wake());
         let _ = app.roster.save_to(&app.files, &app.dirs.accounts_file());
         Ok(app)
     }
@@ -1386,6 +1390,7 @@ impl App {
             video_chat: None,
             video_wanted: None,
             voice_chat: None,
+            voice_clip_chat: None,
             voice_wanted: None,
             recording: None,
             media_hold: None,
@@ -1479,6 +1484,7 @@ impl App {
             call_member_frames: HashMap::new(),
             call_member_textures: HashMap::new(),
             start_with_system: None,
+            login_item: Default::default(),
             waker,
             tray: None,
             power: fastframe_power::Power::fixed(Default::default()),
@@ -1695,6 +1701,7 @@ impl App {
         self.video_wanted = None;
         self.motion_playing = None;
         self.voice_chat = None;
+        self.voice_clip_chat = None;
         self.voice_wanted = None;
         self.recording = None;
         self.image_preview = None;
@@ -2239,6 +2246,14 @@ impl App {
         self.chats.iter().find(|chat| chat.id == id)
     }
 
+    /// The speed voice messages play at in `chat`: its own, else the one in
+    /// Settings.
+    pub fn voice_speed_in(&self, chat: Option<&str>) -> f32 {
+        chat.and_then(|chat| self.chat(chat))
+            .and_then(|chat| chat.voice_speed)
+            .unwrap_or(self.settings.voice_speed)
+    }
+
     pub fn chat_mut(&mut self, id: &str) -> Option<&mut Chat> {
         self.chats.iter_mut().find(|chat| chat.id == id)
     }
@@ -2642,7 +2657,7 @@ impl App {
             Content::Text { text, .. } | Content::Interactive { text, .. } => {
                 crate::markup::plain(text, &self.mention_list(message))
             }
-            _ => self.preview_line(&message.summary(), message),
+            _ => self.preview_line(&message.summary_in(self.locale), message),
         }
     }
 
@@ -3124,6 +3139,7 @@ impl App {
                 self.me_about = about;
             }
             Event::Call(update) => self.handle_call_update(*update),
+            Event::PhoneOnlyCall(update) => self.handle_phone_only_call(*update),
             Event::CallDevices(devices) => self.call_devices = *devices,
             Event::CallVideo {
                 local,
@@ -4030,6 +4046,16 @@ impl App {
                     "This chat already has three pinned messages" => crate::i18n::gettext(
                         self.locale,
                         "This chat already has three pinned messages",
+                    )
+                    .into_owned(),
+                    crate::calls::GROUP_CALLS_NOT_ENABLED => crate::i18n::gettext(
+                        self.locale,
+                        "WhatsApp hasn't turned on group calls from a computer for your account yet. Ask someone in the group to call it, and answer here.",
+                    )
+                    .into_owned(),
+                    crate::calls::CALL_LINKS_OFF => crate::i18n::gettext(
+                        self.locale,
+                        "ZapFast can't join group calls yet: open the link on your phone.",
                     )
                     .into_owned(),
                     _ => message,
@@ -6628,7 +6654,14 @@ impl App {
             }
             Action::OpenUrl(url) => {
                 if let Some((token, video)) = crate::safety::call_link(&url) {
-                    self.join_call_link(token, video);
+                    if crate::calls::group_calls_enabled() {
+                        self.join_call_link(token, video);
+                    } else {
+                        self.toast(crate::i18n::gettext(
+                            self.locale,
+                            "ZapFast can't join group calls yet: open the link on your phone.",
+                        ));
+                    }
                 } else if let Some(code) = crate::safety::group_invite_code(&url) {
                     self.invite = Some(crate::model::GroupInvite {
                         code: code.clone(),
@@ -7126,12 +7159,15 @@ impl App {
                 self.video.stop();
                 self.voice_wanted = None;
                 self.voice_chat = self.open_chat.clone();
+                self.voice_clip_chat = self.open_chat.clone();
+                self.sync_voice_speed();
                 if let Err(error) = self.player.seek(&message, &path, fraction) {
                     self.toast_error(error);
                 }
             }
             Action::SetVoiceSpeed(speed) => {
-                self.settings.voice_speed = self.player.set_speed(speed);
+                self.settings.voice_speed = crate::audio::supported_speed(speed);
+                self.sync_voice_speed();
                 self.mark_settings_dirty();
             }
             Action::TranscribeVoice {
@@ -8217,6 +8253,7 @@ impl App {
                 self.backend.send(Command::SetChatSound { chat, sound });
             }
             Action::PickChatSound(chat) => self.backend.send(Command::PickChatSound(chat)),
+            Action::SetChatVoiceSpeed { chat, speed } => self.set_chat_voice_speed(chat, speed),
             Action::SetDownloadFolder(folder) => {
                 self.settings.download_folder = folder.clone();
                 self.mark_settings_dirty();
@@ -8251,10 +8288,10 @@ impl App {
                     account.backend.send(Command::SetProxy(value.clone()));
                 }
             }
-            Action::SetStartWithSystem(enabled) => match crate::autostart::set(enabled) {
-                Ok(()) => self.start_with_system = Some(crate::autostart::enabled()),
-                Err(error) => self.toast_error(format!("Could not change the login item: {error}")),
-            },
+            Action::SetStartWithSystem(enabled) => {
+                let waker = self.waker.clone();
+                self.login_item.set(enabled, move || waker.wake());
+            }
             Action::ZoomBy(delta) => {
                 self.settings.zoom = (self.settings.zoom + delta).clamp(0.6, 2.0);
                 self.zoom_applied = false;
@@ -8553,6 +8590,7 @@ impl App {
             self.window_focused = false;
         }
         self.tick_app_lock(ctx);
+        self.tick_login_item();
         // Nobody reads behind the lock screen: messages stay unread, the
         // phone keeps notifying, and notifications here say nothing.
         if self.app_lock.is_locked() {
@@ -8630,6 +8668,27 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
+        }
+    }
+
+    /// Collects a finished read or change of the login item.
+    fn tick_login_item(&mut self) {
+        let Some(outcome) = self.login_item.poll() else {
+            return;
+        };
+        match outcome.state {
+            Ok(state) => {
+                self.start_with_system = crate::autostart::switch(state);
+                if outcome.changed && matches!(state, fastframe_autostart::State::NeedsApproval(_))
+                {
+                    self.toast("Allow ZapFast in System Settings, under Login Items.");
+                }
+            }
+            Err(error) => {
+                if outcome.changed {
+                    self.toast_error(format!("Could not change the login item: {error}"));
+                }
+            }
         }
     }
 
@@ -9026,6 +9085,8 @@ impl App {
         self.video.stop();
         self.voice_wanted = None;
         self.voice_chat = self.open_chat.clone();
+        self.voice_clip_chat = self.open_chat.clone();
+        self.sync_voice_speed();
         if let Err(error) = self.player.toggle(&message, &path) {
             self.toast_error(error);
             return;
@@ -9114,6 +9175,25 @@ impl App {
         for (chat, message, path) in pending {
             self.transcribe_voice(chat, message, path);
         }
+    }
+
+    /// Gives `chat` its own voice message speed, or `None` to follow
+    /// Settings.
+    fn set_chat_voice_speed(&mut self, chat: ChatId, speed: Option<f32>) {
+        let speed = speed.map(crate::audio::supported_speed);
+        if let Some(known) = self.chat_mut(&chat) {
+            known.voice_speed = speed;
+        }
+        self.sync_voice_speed();
+        self.backend
+            .send(Command::SetChatVoiceSpeed { chat, speed });
+    }
+
+    /// Plays the clip in the player at the speed of its own chat, which may
+    /// not be the one on screen.
+    fn sync_voice_speed(&mut self) {
+        let chat = self.voice_clip_chat.clone().or(self.open_chat.clone());
+        self.player.set_speed(self.voice_speed_in(chat.as_deref()));
     }
 
     fn tell_played(&mut self, message: String) {
@@ -15464,6 +15544,7 @@ mod tests {
         assert!(!app.addresses_us(&someone_else));
 
         let quote = |sender: &str| crate::model::Quoted {
+            labelled: None,
             chat: None,
             id: "earlier".into(),
             sender: sender.into(),
@@ -20253,6 +20334,68 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_with_its_own_speed_keeps_it_and_leaves_settings_alone() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let (own, other) = ("1@s.whatsapp.net", "2@s.whatsapp.net");
+        app.chats.push(Chat::new(own.into(), "Ada".into()));
+        app.chats.push(Chat::new(other.into(), "Bob".into()));
+        app.apply(Action::SetVoiceSpeed(2.0), &ctx);
+
+        app.open_chat(own.into());
+        app.apply(
+            Action::SetChatVoiceSpeed {
+                chat: own.into(),
+                speed: Some(1.0),
+            },
+            &ctx,
+        );
+        assert_eq!(app.voice_speed_in(Some(own)), 1.0);
+        assert_eq!(app.player.speed(), 1.0);
+        assert_eq!(app.voice_speed_in(Some(other)), 2.0);
+
+        // Settings leave a chat with its own speed alone.
+        app.apply(
+            Action::SetChatVoiceSpeed {
+                chat: own.into(),
+                speed: Some(1.5),
+            },
+            &ctx,
+        );
+        app.open_chat(other.into());
+        app.apply(Action::SetVoiceSpeed(1.25), &ctx);
+        assert_eq!(app.settings.voice_speed, 1.25);
+        assert_eq!(app.chat(own).unwrap().voice_speed, Some(1.5));
+
+        // A clip from that chat still playing in another chat keeps the
+        // chat's speed when Settings change, and follows the chat's own.
+        app.voice_clip_chat = Some(own.into());
+        app.apply(Action::SetVoiceSpeed(2.0), &ctx);
+        assert_eq!(app.settings.voice_speed, 2.0);
+        assert_eq!(app.player.speed(), 1.5);
+        app.apply(
+            Action::SetChatVoiceSpeed {
+                chat: own.into(),
+                speed: Some(1.0),
+            },
+            &ctx,
+        );
+        assert_eq!(app.player.speed(), 1.0);
+        app.voice_clip_chat = None;
+        app.apply(Action::SetVoiceSpeed(1.25), &ctx);
+
+        // Back to Default, the chat follows Settings again.
+        app.apply(
+            Action::SetChatVoiceSpeed {
+                chat: own.into(),
+                speed: None,
+            },
+            &ctx,
+        );
+        assert_eq!(app.voice_speed_in(Some(own)), 1.25);
+    }
+
+    #[test]
     fn a_saved_speed_between_choices_snaps_to_one() {
         let root = std::env::temp_dir().join(format!("zapfast-speed-{}", std::process::id()));
         let settings = Settings {
@@ -21602,6 +21745,7 @@ mod app_lock_tests {
         }];
         let mut reply = plain.clone();
         reply.quoted = Some(crate::model::Quoted {
+            labelled: None,
             chat: None,
             id: "earlier".into(),
             sender: "15550001111@s.whatsapp.net".into(),

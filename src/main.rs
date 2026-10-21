@@ -330,6 +330,12 @@ fn run() -> eframe::Result<()> {
         log::error!("could not move the linked account into its folder: {error}");
         return Err(eframe::Error::AppCreation(error.into()));
     }
+    // The name and icon volume mixers show for every sound ZapFast plays or records; set before
+    // anything opens or lists a device.
+    let _ = fastframe_audio::set_app_info(fastframe_audio::AppInfo {
+        name: "ZapFast".into(),
+        icon: Some("zapfast".into()),
+    });
     let settings = settings::Settings::load(&dirs.settings_file());
     // The drawn title bar (Windows and Linux): GNOME's button layout and
     // icons, read once, and the choice every window is made with.
@@ -339,6 +345,12 @@ fn run() -> eframe::Result<()> {
     #[cfg(not(feature = "demo"))]
     let custom_titlebar = settings.custom_titlebar;
     fastframe_titlebar::set_enabled(custom_titlebar);
+    // A Cargo build has no application bundle to supply its Dock icon.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = fastframe_dock::set_icon(include_bytes!("../packaging/macos/icon-1024.png"))
+    {
+        log::warn!("could not set the Dock icon: {error}");
+    }
     let demo_persistence = demo.then(|| dirs.state.join("window.ron"));
 
     #[allow(unused_mut)]
@@ -768,7 +780,11 @@ impl Shell {
         app.window_logic(ctx);
         #[cfg(target_os = "windows")]
         if let (Some(window), Some(count)) = (frame.winit_window(), app.taskbar_badge_count())
-            && let Some(at) = self.taskbar.show(window, count, app.locale)
+            && let Some(at) = self.taskbar.show(
+                window,
+                count,
+                &zapfast::notify::badge_description(count, app.locale),
+            )
         {
             ctx.request_repaint_after(at.saturating_duration_since(std::time::Instant::now()));
         }
@@ -836,15 +852,9 @@ impl Shell {
 fn app_icon() -> egui::IconData {
     #[cfg(target_os = "macos")]
     {
-        // eframe replaces the bundle's Dock icon with this viewport icon.
-        let image = image::load_from_memory(include_bytes!("../packaging/macos/icon-1024.png"))
-            .expect("bundled macOS icon")
-            .into_rgba8();
-        egui::IconData {
-            width: image.width(),
-            height: image.height(),
-            rgba: image.into_raw(),
-        }
+        // Fastframe sets an unbundled process's Dock icon once. A viewport
+        // icon would overwrite the packaged bundle's image on every reopen.
+        egui::IconData::default()
     }
     #[cfg(not(target_os = "macos"))]
     {

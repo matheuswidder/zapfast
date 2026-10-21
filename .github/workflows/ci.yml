@@ -18,7 +18,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Dependencies come only from crates.io or from crmne repositories, and
+  # Dependencies come only from the approved sources in CONTRIBUTING.md, and
   # review evidence (captures, comparison pages, recordings) stays in the pull
   # request instead of the tree. See CONTRIBUTING.md.
   policy:
@@ -60,7 +60,7 @@ jobs:
       - name: GUI build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev cmake perl
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev libpipewire-0.3-dev clang libclang-dev cmake perl
       # After the toolchain, so the cache key follows the pinned rustc. The
       # key carries no job name, so each job sets its own generation. Saves
       # only on pushes to main; pull requests restore.
@@ -81,7 +81,9 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # A cold Windows build passed both suites in 59 minutes, then timed out
+    # saving mbx's cache. Leave enough time for that cache to reach later runs.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 90 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -93,7 +95,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev cmake perl
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev libpipewire-0.3-dev clang libclang-dev cmake perl
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: test-v1

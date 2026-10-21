@@ -577,6 +577,7 @@ pub fn populate(app: &mut App) {
             .messages
             .last()
             .map(|last| crate::model::LastMessage {
+                labelled: last.content.labelled(),
                 from_me: last.from_me,
                 sender: last.sender.clone(),
                 sender_name: last.sender_name.clone(),
@@ -671,6 +672,7 @@ pub fn populate(app: &mut App) {
                 Content::text("Listened, agreed on *all three* points."),
             );
             row.quoted = Some(Quoted {
+                labelled: None,
                 chat: None,
                 id: "ada-voice".into(),
                 sender: ada.into(),
@@ -886,6 +888,7 @@ pub fn populate(app: &mut App) {
             row.sender = mira.0.to_owned();
             row.sender_name = Some(mira.1.to_owned());
             row.quoted = Some(Quoted {
+                labelled: None,
                 chat: None,
                 id: format!("{group}-3"),
                 sender: jonas.0.into(),
@@ -951,6 +954,7 @@ pub fn populate(app: &mut App) {
                         chat.id.clone(),
                         last.timestamp,
                         crate::model::LastMessage {
+                            labelled: last.content.labelled(),
                             from_me: last.from_me,
                             sender: last.sender.clone(),
                             sender_name: last.sender_name.clone(),
@@ -1134,6 +1138,7 @@ fn quote_sample(app: &mut App) {
             Content::text("See you there!"),
         );
         reply.quoted = Some(Quoted {
+            labelled: None,
             chat: None,
             id: "group-reply".into(),
             sender,
@@ -1167,6 +1172,7 @@ fn meta_ai_sample(app: &mut App) {
         ),
     );
     reply.quoted = Some(Quoted {
+        labelled: None,
         chat: None,
         id: "meta-ai-question".into(),
         sender: ME.into(),
@@ -1177,6 +1183,7 @@ fn meta_ai_sample(app: &mut App) {
     let mut chat = Chat::new(id.into(), "Meta AI".into());
     chat.last_activity = now;
     chat.last = Some(crate::model::LastMessage {
+        labelled: reply.content.labelled(),
         from_me: false,
         sender: reply.sender.clone(),
         sender_name: None,
@@ -1276,6 +1283,7 @@ fn interactive_sample(app: &mut App, with_image: bool) {
         },
     );
     reply.quoted = Some(Quoted {
+        labelled: None,
         chat: None,
         id: "interactive-card".into(),
         sender: id.into(),
@@ -1307,6 +1315,7 @@ fn interactive_sample(app: &mut App, with_image: bool) {
         let last = messages.last().unwrap();
         chat.last_activity = last.timestamp;
         chat.last = Some(crate::model::LastMessage {
+            labelled: last.content.labelled(),
             from_me: last.from_me,
             sender: last.sender.clone(),
             sender_name: None,
@@ -1741,6 +1750,7 @@ fn bubbles_sample(app: &mut App) {
         message(id, "bubbles-out-4", true, 0, text("Then coffee is on me")),
     ];
     rows[4].quoted = Some(crate::model::Quoted {
+        labelled: None,
         id: "bubbles-in-2".into(),
         sender: id.into(),
         sender_name: None,
@@ -2101,6 +2111,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 let messages = &mut app.conversations.get_mut(SAMPLES[0].id).unwrap().messages;
                 messages[3].content.media_at_mut(None).unwrap().path = Some(saved);
                 messages[2].quoted = Some(crate::model::Quoted {
+                    labelled: None,
                     id: "synthetic-quoted-message".into(),
                     sender: SAMPLES[0].id.into(),
                     sender_name: Some("Alex".into()),
@@ -2365,6 +2376,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     let mut reply =
                         message(chat, id, own, now - 60, Content::text("Reply preview test"));
                     reply.quoted = Some(Quoted {
+                        labelled: None,
                         chat: None,
                         id: "arabic-original".into(),
                         sender: chat.into(),
@@ -2402,6 +2414,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         let mut reply =
                             message(id, "rtl-reply", true, now, Content::text("שלום עולם"));
                         reply.quoted = Some(Quoted {
+                            labelled: None,
                             chat: None,
                             id: "rtl-hebrew".into(),
                             sender: SAMPLES[0].id.into(),
@@ -2419,6 +2432,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         let text = Content::text("עולה 3.14 ש״ח");
                         let mut reply = message(id, "rtl-digits-reply", false, now, text);
                         reply.quoted = Some(Quoted {
+                            labelled: None,
                             chat: None,
                             id: "rtl-digits".into(),
                             sender: ME.into(),
@@ -2456,6 +2470,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 let mut chat = Chat::new(ME.into(), "You".into());
                 chat.last_activity = now;
                 chat.last = messages.last().map(|last| crate::model::LastMessage {
+                    labelled: last.content.labelled(),
                     from_me: true,
                     sender: last.sender.clone(),
                     sender_name: None,
@@ -2556,6 +2571,32 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
             // A group's video call: three members' cameras on, Tom's off, and
             // ours in the corner.
             "call-group-video" => group_call_sample(app, false, true),
+            // A call we started in the group: nobody has joined yet, so
+            // everyone on it reads Invited while it rings.
+            "call-group-calling" => {
+                group_call_sample(app, false, false);
+                if let Some(call) = app.call.as_mut() {
+                    call.direction = crate::model::CallDirection::Outgoing;
+                    call.phase = CallPhase::Dialing;
+                    call.started = None;
+                    if let Some(group) = call.group.as_mut() {
+                        group.caller = None;
+                        for person in &mut group.participants {
+                            person.joined = false;
+                        }
+                    }
+                }
+            }
+            // While group calls are off (`calls::GROUP_CALLS_ENABLED`), a group
+            // call to us does not take the screen: the window says who is
+            // calling the group and to answer on the phone.
+            "call-group-on-phone" => {
+                group_call_sample(app, true, false);
+                if let Some(update) = app.call.take() {
+                    app.call_account = None;
+                    app.handle_phone_only_call(update);
+                }
+            }
             // The same call with our microphone muted: our own tile says so.
             "call-group-muted" => {
                 group_call_sample(app, false, false);
@@ -2595,6 +2636,10 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 }
                 app.scroll_to_bottom = true;
             }
+            // Every kind of call entry in a group: answered with a length,
+            // unanswered, missed and declined, voice and video, ours and
+            // members' (whose names head their bubbles).
+            "call-bubbles" => call_bubbles_sample(app),
             // The Calls tab: with no chat open, its start pane; with the
             // chat that was open, that chat beside the history; with a row
             // picked, that row's chat at the call.
@@ -3143,6 +3188,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 let mut chat = Chat::new(ME.into(), "You".into());
                 chat.last_activity = now;
                 chat.last = messages.last().map(|last| crate::model::LastMessage {
+                    labelled: last.content.labelled(),
                     from_me: true,
                     sender: last.sender.clone(),
                     sender_name: None,
@@ -3905,6 +3951,76 @@ fn call_entries(now: i64) -> Vec<Message> {
         entry.status = Delivery::None;
     }
     entries
+}
+
+/// Opens Rust Berlin with a run of call entries at its end, one of each
+/// kind a group's transcript files, for the `call-bubbles` page. They are
+/// the newest messages, so they share one screen.
+fn call_bubbles_sample(app: &mut App) {
+    use crate::model::CallStatus;
+    let chat = SAMPLES[1].id;
+    let now = crate::util::now();
+    let entries = [
+        // (sender, minutes ago, video, status, seconds)
+        (
+            Some(("491701111111@s.whatsapp.net", "Jonas")),
+            12,
+            true,
+            CallStatus::Answered,
+            2_173,
+        ),
+        (None, 10, true, CallStatus::NoAnswer, 0),
+        (
+            Some(("491702222222@s.whatsapp.net", "Mira")),
+            8,
+            false,
+            CallStatus::Answered,
+            36,
+        ),
+        (None, 6, false, CallStatus::Answered, 754),
+        (
+            Some(("491703333333@s.whatsapp.net", "Tom")),
+            4,
+            false,
+            CallStatus::Missed,
+            0,
+        ),
+        (
+            Some(("491701111111@s.whatsapp.net", "Jonas")),
+            2,
+            true,
+            CallStatus::Declined,
+            0,
+        ),
+    ];
+    let Some(conversation) = app.conversations.get_mut(chat) else {
+        return;
+    };
+    for (index, (sender, minutes, video, status, duration)) in entries.into_iter().enumerate() {
+        let mut entry = message(
+            chat,
+            &format!("{}bubble-{index}", crate::model::CALL_ENTRY_PREFIX),
+            sender.is_none(),
+            now - minutes * 60,
+            Content::Call {
+                video,
+                status,
+                duration,
+                group: true,
+            },
+        );
+        if let Some((id, name)) = sender {
+            entry.sender = id.to_owned();
+            entry.sender_name = Some(name.to_owned());
+        }
+        entry.status = Delivery::None;
+        conversation.messages.push(entry);
+    }
+    conversation
+        .messages
+        .sort_by_key(|message| message.timestamp);
+    app.open_chat = Some(chat.to_owned());
+    app.scroll_to_bottom = true;
 }
 
 pub fn call_sample(app: &mut App, incoming: bool, video: bool) {
@@ -6104,6 +6220,8 @@ mod tests {
             "calls-missed-none",
             "new-call",
             "call-entries",
+            "call-bubbles",
+            "call-bubbles,light",
             "call",
             "call-active",
             "call-outgoing",
@@ -6116,6 +6234,8 @@ mod tests {
             "call-group-active",
             "call-group-video",
             "call-group-muted",
+            "call-group-calling",
+            "call-group-on-phone",
             "call-link",
             "calls-link",
             "call-video",
@@ -6212,7 +6332,16 @@ mod tests {
     /// and in each layout: GNOME's buttons at the right or the left, and
     /// Windows' taller row. Headers that reach a corner leave the buttons
     /// room beside their own controls, or move them down when narrow.
+    ///
+    /// Not on macOS, which never draws them: its headers keep the traffic
+    /// lights' layout under any preview, and drag the window from their top
+    /// (fastframe-titlebar's drag area, which senses clicks) wherever the
+    /// caption buttons would stand.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS has the traffic lights, never the drawn caption buttons"
+    )]
     fn header_controls_keep_clear_of_the_drawn_caption_buttons() {
         use fastframe_titlebar::Footprint;
         let footprints = [
@@ -6255,6 +6384,9 @@ mod tests {
             ("call-group-video", wide),
             ("call-group-video", narrow),
             ("call-group-muted", wide),
+            ("call-group-calling", wide),
+            ("call-group-on-phone", wide),
+            ("call-group-on-phone", narrow),
             ("calls-link", wide),
             ("settings", wide),
             ("settings", narrow),
@@ -6819,6 +6951,7 @@ mod tests {
         for chat in app.chats.iter_mut() {
             if chat.id == group || chat.id == typing {
                 chat.last = Some(crate::model::LastMessage {
+                    labelled: false,
                     from_me: false,
                     sender: sender.into(),
                     sender_name: Some("Linus Example".into()),
@@ -6828,6 +6961,7 @@ mod tests {
                 });
             } else if chat.id == direct {
                 chat.last = Some(crate::model::LastMessage {
+                    labelled: false,
                     from_me: false,
                     sender: direct.into(),
                     sender_name: None,
@@ -7497,6 +7631,59 @@ mod tests {
                 "choosing {option}x from the menu reaches App and settings"
             );
         }
+    }
+
+    /// In a chat with its own speed, the chip and the message menu change
+    /// that chat's speed and leave the one in Settings alone.
+    #[test]
+    fn a_chat_with_its_own_speed_changes_only_its_own() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.settings.voice_speed = 2.0;
+        let chat = sample_ids()[0].to_owned();
+        app.chat_mut(&chat).unwrap().voice_speed = Some(1.0);
+        let mut clip = media("audio/ogg; codecs=opus", 12_000, None, None);
+        clip.path = Some(std::path::PathBuf::from("demo/voice.ogg"));
+        app.conversations.get_mut(&chat).unwrap().messages = vec![message(
+            &chat,
+            "voice-speed",
+            false,
+            100,
+            Content::Audio {
+                media: clip,
+                seconds: Some(5),
+                voice_note: true,
+                waveform: demo_waveform(),
+            },
+        )];
+        render(&mut app, &ctx);
+        let click = |app: &mut App, id: egui::Id, button: egui::PointerButton| {
+            let pos = ctx
+                .data(|data| data.get_temp::<egui::Rect>(id))
+                .expect("the speed control is on screen")
+                .center();
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(app, &ctx, vec![egui::Event::PointerMoved(pos), press(true)]);
+            frame_with(app, &ctx, vec![press(false)]);
+            frame_with(app, &ctx, Vec::new());
+        };
+        // The chip starts from the chat's 1x, not the 2x in Settings.
+        let chip = crate::ui::conversation::speed_chip_id(&chat, "voice-speed");
+        click(&mut app, chip, egui::PointerButton::Primary);
+        assert_eq!(app.chat(&chat).unwrap().voice_speed, Some(1.5));
+        assert_eq!(app.player.speed(), 1.5);
+        assert_eq!(app.settings.voice_speed, 2.0);
+        click(&mut app, chip, egui::PointerButton::Secondary);
+        let choice = crate::ui::conversation::speed_button_id(&chat, "voice-speed", 1.25);
+        click(&mut app, choice, egui::PointerButton::Primary);
+        assert_eq!(app.chat(&chat).unwrap().voice_speed, Some(1.25));
+        assert_eq!(app.settings.voice_speed, 2.0);
     }
 
     /// A refused voice message waits above its own chat's composer, where
@@ -13330,6 +13517,7 @@ mod tests {
             );
             if kind == "quote" {
                 row.quoted = Some(Quoted {
+                    labelled: None,
                     chat: None,
                     id: "original".into(),
                     sender: chat.clone(),
@@ -14338,6 +14526,7 @@ mod tests {
                 Content::text("See you there"),
             );
             reply.quoted = Some(Quoted {
+                labelled: Some(original.content.labelled()),
                 chat: Some(group.into()),
                 id: original.id,
                 sender: original.sender,
@@ -15037,6 +15226,264 @@ mod tests {
                 (middle - control).abs() <= 1.0 / scale + 0.05,
                 "at {scale}x the text centres on {middle}, the controls on {control}"
             );
+        }
+    }
+
+    /// Every painted copy of `needle` in `shapes`: its ink's top and bottom
+    /// (the glyphs' own pixels, not the line box) and its galley's rect.
+    fn painted_ink(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Vec<(f32, f32, egui::Rect)> {
+        let mut found = Vec::new();
+        let mut stack: Vec<&egui::Shape> = shapes.iter().map(|clipped| &clipped.shape).collect();
+        while let Some(shape) = stack.pop() {
+            match shape {
+                egui::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+                egui::Shape::Text(text) if text.galley.text() == needle => {
+                    let mut ink: Option<(f32, f32)> = None;
+                    for row in &text.galley.rows {
+                        for glyph in row
+                            .glyphs
+                            .iter()
+                            .filter(|glyph| !glyph.uv_rect.is_nothing())
+                        {
+                            let top = text.pos.y + row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+                            let bottom = top + glyph.uv_rect.size.y;
+                            ink = Some(
+                                ink.map_or((top, bottom), |(t, b)| (t.min(top), b.max(bottom))),
+                            );
+                        }
+                    }
+                    if let Some((top, bottom)) = ink {
+                        found.push((
+                            top,
+                            bottom,
+                            egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// The chat list's search field centres a capital's ink, from its top to
+    /// the baseline, on the field and its icons at every scale; the hint sits
+    /// on the same line, and the clear button's cross on the same centre.
+    /// Centring the line box left text below the magnifier and the cross
+    /// lower still, and centring descenders too lifted most words above it.
+    #[test]
+    fn the_search_fields_text_centres_on_its_icons_at_every_scale() {
+        // A capital's ink, from its top to the baseline, centres on the field.
+        const DRAFT: &str = "H";
+        let field = egui::Id::new("chat-search");
+        for scale in [1.0_f32, 1.25, 1.333_333, 1.5, 2.0] {
+            let mut ink_at = None;
+            let mut hint_at = None;
+            for text in [DRAFT, ""] {
+                let mut app = app();
+                app.search = text.into();
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                app.attach(&ctx);
+                let mut shapes = Vec::new();
+                let mut nodes = Vec::new();
+                for _ in 0..4 {
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1180.0, 780.0),
+                        )),
+                        ..Default::default()
+                    };
+                    input
+                        .viewports
+                        .entry(egui::ViewportId::ROOT)
+                        .or_default()
+                        .native_pixels_per_point = Some(scale);
+                    let mut output = ctx.run_ui(input, |ui| {
+                        let ctx = ui.ctx().clone();
+                        app.background_frame(&ctx);
+                        app.frame_ui(ui);
+                    });
+                    output.textures_delta.clear();
+                    shapes = output.shapes;
+                    nodes = output
+                        .platform_output
+                        .accesskit_update
+                        .map(|update| {
+                            update
+                                .nodes
+                                .into_iter()
+                                .filter_map(|(_, node)| {
+                                    let label = node.label()?.to_owned();
+                                    let bounds = node.bounds()?;
+                                    Some((label, ((bounds.y0 + bounds.y1) / 2.0) as f32))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                }
+                let pill = ctx
+                    .read_response(field.with("pill"))
+                    .expect("the search field is drawn")
+                    .rect;
+                let centre = pill.center().y;
+                let tolerance = 1.0 / scale + 0.05;
+                let galley = ctx
+                    .data(|data| {
+                        data.get_temp::<egui::Rect>(crate::ui::widgets::search_galley_id(field))
+                    })
+                    .expect("the field publishes its text's place");
+                if text.is_empty() {
+                    let (_, _, hint) = painted_ink(&shapes, "Search")
+                        .into_iter()
+                        .find(|(_, _, rect)| pill.contains(rect.center()))
+                        .expect("the hint is painted in the field");
+                    assert!(
+                        (hint.top() - galley.top()).abs() < 0.01,
+                        "at {scale}x the hint starts at {}, typed text at {}",
+                        hint.top(),
+                        galley.top()
+                    );
+                    hint_at = Some(hint.top());
+                } else {
+                    let (top, bottom, _) = painted_ink(&shapes, DRAFT)
+                        .into_iter()
+                        .find(|(_, _, rect)| pill.contains(rect.center()))
+                        .expect("the draft is painted in the field");
+                    let middle = (top + bottom) / 2.0;
+                    assert!(
+                        (middle - centre).abs() <= tolerance,
+                        "at {scale}x the text centres on {middle}, the field on {centre}"
+                    );
+                    let clear = nodes
+                        .iter()
+                        .find(|(label, _)| label == "Clear")
+                        .map(|(_, y)| *y)
+                        .expect("the clear button is labelled");
+                    assert!(
+                        (clear - centre).abs() <= tolerance,
+                        "at {scale}x the clear button centres on {clear}, the field on {centre}"
+                    );
+                    ink_at = Some(galley.top());
+                }
+            }
+            assert_eq!(ink_at, hint_at, "at {scale}x hint and text share a line");
+        }
+    }
+
+    /// A call entry draws as WhatsApp's: the glyph's disc centred on the
+    /// title and detail together, the detail under the title at its start,
+    /// and the time on the detail's line at the bubble's end, on both sides
+    /// of a group, where a sender's name heads the bubble.
+    #[test]
+    fn a_call_entry_centres_its_glyph_and_tucks_its_time_beside_the_detail() {
+        let mut app = app();
+        apply_flags(&mut app, Some("call-bubbles"));
+        let chat = SAMPLES[1].id;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            shapes = frame_sized(&mut app, &ctx, 1400.0, Vec::new());
+        }
+        let calls: Vec<Message> = app.conversations[chat]
+            .messages
+            .iter()
+            .filter(|message| matches!(message.content, Content::Call { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(calls.len(), 6, "the sample files six calls");
+        let mut discs = Vec::new();
+        let mut stack: Vec<&egui::Shape> = shapes.iter().map(|clipped| &clipped.shape).collect();
+        while let Some(shape) = stack.pop() {
+            match shape {
+                egui::Shape::Vec(shapes) => stack.extend(shapes.iter()),
+                egui::Shape::Circle(circle) if (circle.radius - 18.0).abs() < 0.01 => {
+                    discs.push(circle.center);
+                }
+                _ => {}
+            }
+        }
+        for message in &calls {
+            let entry = crate::ui::calls::Entry::of(message).unwrap();
+            let bubble = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(
+                        crate::ui::conversation::bubble_id(chat, &message.id).with("rect"),
+                    )
+                })
+                .unwrap_or_else(|| panic!("{} is drawn", message.id));
+            let inside = |rect: &egui::Rect| bubble.contains(rect.center());
+            let title = painted_ink(&shapes, &entry.title(app.locale))
+                .into_iter()
+                .map(|(_, _, rect)| rect)
+                .find(inside)
+                .unwrap_or_else(|| panic!("{}'s title is painted", message.id));
+            let disc = discs
+                .iter()
+                .copied()
+                .find(|centre| bubble.contains(*centre))
+                .unwrap_or_else(|| panic!("{}'s glyph sits in a disc", message.id));
+            let footer = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(crate::ui::conversation::footer_id(
+                        chat,
+                        &message.id,
+                    ))
+                })
+                .expect("the time is drawn");
+            assert!(disc.x < title.left(), "{}: the disc leads", message.id);
+            assert!(
+                footer.right() <= bubble.right() - 9.0 && footer.bottom() <= bubble.bottom(),
+                "{}: the time stays inside the bubble's padding",
+                message.id
+            );
+            match entry.detail(app.locale) {
+                Some(detail) => {
+                    let detail = painted_ink(&shapes, &detail)
+                        .into_iter()
+                        .map(|(_, _, rect)| rect)
+                        .find(inside)
+                        .unwrap_or_else(|| panic!("{}'s detail is painted", message.id));
+                    assert!(
+                        (detail.left() - title.left()).abs() < 0.01,
+                        "{}: title and detail share a start",
+                        message.id
+                    );
+                    assert!(detail.top() >= title.bottom(), "{}", message.id);
+                    let block = (title.top() + detail.bottom()) / 2.0;
+                    assert!(
+                        (disc.y - block).abs() <= 1.0,
+                        "{}: the disc centres on {}, the words on {block}",
+                        message.id,
+                        disc.y
+                    );
+                    assert!(
+                        (footer.center().y - detail.center().y).abs() <= 0.5,
+                        "{}: the time sits on the detail's line",
+                        message.id
+                    );
+                    assert!(
+                        footer.left() >= detail.right() + 8.0,
+                        "{}: the time follows the detail",
+                        message.id
+                    );
+                }
+                None => {
+                    assert!(footer.top() >= title.bottom(), "{}", message.id);
+                    let block = (title.top() + footer.bottom()) / 2.0;
+                    assert!(
+                        (disc.y - block).abs() <= 1.0,
+                        "{}: the disc centres on {}, title and time on {block}",
+                        message.id,
+                        disc.y
+                    );
+                }
+            }
         }
     }
 
@@ -16098,56 +16545,73 @@ mod tests {
         assert!(reached_hidden, "Tab reached chats that were out of view");
     }
 
+    /// The same with the list hidden, at the window's least height: the
+    /// chats' avatars scroll between the rail's groups, and the macOS layout,
+    /// which starts the rail under the traffic lights, leaves them least.
     #[test]
     fn tab_scrolls_a_focused_collapsed_avatar_into_view() {
-        let mut app = app();
-        apply_flags(&mut app, Some("settings,rail"));
-        let ctx = egui::Context::default();
-        app.attach(&ctx);
-        let height = 300.0;
-        for _ in 0..3 {
-            frame_sized(&mut app, &ctx, height, Vec::new());
-        }
-        let avatar = |ctx: &egui::Context, id: &str| {
-            ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::compact_chat_id(id)))
-        };
-        let ids: Vec<String> = app.chats.iter().map(|chat| chat.id.clone()).collect();
-        let hidden: Vec<&String> = ids
-            .iter()
-            .filter(|id| avatar(&ctx, id).is_none_or(|rect| rect.top() >= height))
-            .collect();
-        assert!(
-            !hidden.is_empty(),
-            "the window is short enough to hide avatars"
-        );
-        let mut reached_hidden = false;
-        for _ in 0..40 {
-            frame_sized(&mut app, &ctx, height, tab());
+        for macos in [false, true] {
+            let mut app = app();
+            apply_flags(&mut app, Some("settings,rail"));
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            if macos {
+                crate::theme::preview_macos(&ctx);
+            }
+            // `main`'s least window height.
+            let height = 300.0;
             for _ in 0..3 {
                 frame_sized(&mut app, &ctx, height, Vec::new());
             }
-            let Some(focused) = ctx
-                .memory(|memory| memory.focused())
-                .and_then(|id| ctx.read_response(id))
-            else {
-                continue;
+            let avatar = |ctx: &egui::Context, id: &str| {
+                ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::compact_chat_id(id)))
             };
-            // Settings has its own scrolling; only the rail is under test.
-            if !ids
+            let ids: Vec<String> = app.chats.iter().map(|chat| chat.id.clone()).collect();
+            let hidden: Vec<&String> = ids
                 .iter()
-                .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect))
-            {
-                continue;
-            }
-            assert_eq!(
-                focused.interact_rect, focused.rect,
-                "the focused avatar is fully visible"
+                .filter(|id| avatar(&ctx, id).is_none_or(|rect| rect.top() >= height))
+                .collect();
+            assert!(
+                !hidden.is_empty(),
+                "{macos}: the window is short enough to hide avatars"
             );
-            reached_hidden |= hidden
-                .iter()
-                .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect));
+            let mut reached_hidden = false;
+            for _ in 0..40 {
+                frame_sized(&mut app, &ctx, height, tab());
+                for _ in 0..3 {
+                    frame_sized(&mut app, &ctx, height, Vec::new());
+                }
+                let Some(focused) = ctx
+                    .memory(|memory| memory.focused())
+                    .and_then(|id| ctx.read_response(id))
+                else {
+                    continue;
+                };
+                // Settings has its own scrolling; only the rail is under test.
+                if !ids
+                    .iter()
+                    .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect))
+                {
+                    continue;
+                }
+                assert_eq!(
+                    focused.interact_rect, focused.rect,
+                    "{macos}: the focused avatar is fully visible"
+                );
+                assert!(
+                    focused.rect.bottom() <= height,
+                    "{macos}: inside the window: {:?}",
+                    focused.rect
+                );
+                reached_hidden |= hidden
+                    .iter()
+                    .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect));
+            }
+            assert!(
+                reached_hidden,
+                "{macos}: Tab reached avatars that were out of view"
+            );
         }
-        assert!(reached_hidden, "Tab reached avatars that were out of view");
     }
 
     /// Records the images the UI asks for, answering at once so a frame can be
@@ -17037,6 +17501,14 @@ mod bubble_detail_tests {
     /// by 800 window.
     #[test]
     fn messages_balloons_tail_only_the_last_of_each_run() {
+        // These runs belong to one day. Near midnight a real clock puts a
+        // day boundary between them, correctly giving another bubble a tail.
+        let _clock = crate::util::fixed_clock::set(crate::util::fixed_clock::Clock {
+            // 14:00 UTC on Wednesday 11 March 2026.
+            now: 1_773_237_600,
+            zone: jiff::tz::TimeZone::UTC,
+            twelve_hour: false,
+        });
         const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
         let reach = crate::ui::widgets::balloon::TIP[0] * crate::ui::widgets::MESSAGES_SCALE;
         for page in ["bubbles,messages", "bubbles,messages-light"] {
@@ -17696,6 +18168,105 @@ mod call_surface_tests {
         }
     }
 
+    /// A group's chat offers a voice and a video call in its header, as a person's does, while
+    /// group calls are on; a channel's offers neither.
+    #[test]
+    fn a_groups_header_offers_calls() {
+        let _on = crate::calls::override_group_calls(true);
+        let (mut app, ctx) = header_app();
+        let shown = labels(&mut app, &ctx);
+        for expected in ["Voice call", "Video call"] {
+            assert!(
+                shown.contains(&expected.to_owned()),
+                "{expected} is in the group's header: {shown:?}"
+            );
+        }
+
+        let channel = SAMPLES
+            .iter()
+            .find(|sample| sample.id.ends_with("@newsletter"))
+            .unwrap()
+            .id;
+        app.open_chat = Some(channel.into());
+        let shown = labels(&mut app, &ctx);
+        assert!(
+            !shown.contains(&"Voice call".to_owned()),
+            "a channel has no call button: {shown:?}"
+        );
+    }
+
+    /// With group calls off, a group's header has no call buttons, and a person's keeps them.
+    #[test]
+    fn with_group_calls_off_a_groups_header_offers_no_calls() {
+        let _off = crate::calls::override_group_calls(false);
+        let (mut app, ctx) = header_app();
+        let shown = labels(&mut app, &ctx);
+        for absent in ["Voice call", "Video call"] {
+            assert!(
+                !shown.contains(&absent.to_owned()),
+                "{absent} is not in the group's header: {shown:?}"
+            );
+        }
+        let person = SAMPLES
+            .iter()
+            .find(|sample| sample.id.ends_with("@s.whatsapp.net"))
+            .unwrap()
+            .id;
+        app.open_chat = Some(person.into());
+        let shown = labels(&mut app, &ctx);
+        assert!(
+            shown.contains(&"Voice call".to_owned()),
+            "a person's chat still calls: {shown:?}"
+        );
+    }
+
+    /// The demo with a group's chat open, ready to read its header's labels.
+    fn header_app() -> (App, egui::Context) {
+        let mut app = app();
+        let group = SAMPLES
+            .iter()
+            .find(|sample| sample.id.ends_with("@g.us"))
+            .unwrap()
+            .id;
+        app.open_chat = Some(group.into());
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        ctx.enable_accesskit();
+        (app, ctx)
+    }
+
+    /// A group call that only the phone can answer leaves the screen alone and says so, naming
+    /// who is calling which group.
+    #[test]
+    fn a_group_call_on_the_phone_only_is_a_notice() {
+        let mut app = app();
+        apply_flags(&mut app, Some("call-group-on-phone"));
+        assert!(app.call.is_none(), "no call screen");
+        let notice = app
+            .toasts
+            .iter()
+            .find(|toast| toast.message.contains("answer on your phone"))
+            .expect("the window says so");
+        let group = app.chat_title_of(SAMPLES[1].id);
+        assert!(notice.message.contains(&group), "{}", notice.message);
+    }
+
+    /// A call we started in a group is drawn as the group's, ringing everyone on it: nobody has
+    /// joined, so each reads as invited, and nobody is named as having rung.
+    #[test]
+    fn a_group_call_we_started_rings_its_members() {
+        let mut app = app();
+        apply_flags(&mut app, Some("call-group-calling"));
+        assert_eq!(app.call_name(), "Rust Berlin");
+        assert_eq!(app.call_caller_name(), None);
+        assert!(app.call_people().iter().all(|person| !person.joined));
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        ctx.enable_accesskit();
+        let shown = labels(&mut app, &ctx);
+        assert!(shown.contains(&"Hang up".to_owned()), "{shown:?}");
+    }
+
     /// A group's call rings under the group's name and says who started it, and once up it has a
     /// tile for everyone on its roster, saying who has not joined. A voice call in a group offers
     /// no camera: WhatsApp takes video only in a group call that began as one.
@@ -18020,7 +18591,8 @@ mod rail_tests {
             );
             assert_eq!(settings.size(), egui::vec2(36.0, 36.0));
             assert_eq!(me.size(), egui::vec2(32.0, 32.0));
-            if macos {
+            // A Mac lays out its own way whichever the preview says.
+            if crate::theme::macos_chrome(&ctx) {
                 assert!(
                     top[0].top() >= 36.0 && top[0].top() < 60.0,
                     "just below the traffic lights: {:?}",
@@ -18066,6 +18638,133 @@ mod rail_tests {
             );
             // Under Show the chat list, which takes a cell of its own.
             assert!(avatar.top() >= show.bottom());
+        }
+    }
+
+    /// At the minimum window height, Tab and Shift+Tab reveal every rail
+    /// control, including the bottom group, without crossing the title bar.
+    #[test]
+    fn tab_reveals_every_rail_control_in_a_short_window() {
+        for macos in [false, true] {
+            for page in ["chat", "rail"] {
+                for reverse in [false, true] {
+                    let (mut app, ctx) = open(page, macos);
+                    let size = egui::vec2(1180.0, 300.0);
+                    for _ in 0..3 {
+                        frame_at(&mut app, &ctx, size, Vec::new());
+                    }
+                    let mut expected = vec![
+                        Stop::Chats,
+                        Stop::Calls,
+                        Stop::Starred,
+                        Stop::Archived,
+                        Stop::Locked,
+                        Stop::Settings,
+                        Stop::Profile,
+                    ];
+                    if page == "rail" {
+                        expected.push(Stop::Sidebar);
+                    }
+                    for stop in &expected {
+                        assert!(stop_rect(&ctx, *stop).is_some(), "{stop:?} is offered");
+                    }
+                    ctx.memory_mut(|memory| {
+                        memory.request_focus(rail::destination_id(Destination::Chats));
+                    });
+                    let mut reached = std::collections::BTreeSet::new();
+                    for _ in 0..40 {
+                        frame_at(
+                            &mut app,
+                            &ctx,
+                            size,
+                            vec![egui::Event::Key {
+                                key: egui::Key::Tab,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: if reverse {
+                                    egui::Modifiers::SHIFT
+                                } else {
+                                    egui::Modifiers::NONE
+                                },
+                            }],
+                        );
+                        for _ in 0..3 {
+                            frame_at(&mut app, &ctx, size, Vec::new());
+                        }
+                        let focused = ctx.memory(|memory| memory.focused());
+                        let Some((stop, id)) = focus::stops(&ctx)
+                            .into_iter()
+                            .find(|(stop, id)| Some(*id) == focused && expected.contains(stop))
+                        else {
+                            continue;
+                        };
+                        let response = ctx.read_response(id).unwrap();
+                        let mut viewport = rail_rect(&ctx).unwrap();
+                        if crate::theme::traffic_light_inset(&ctx) > 0.0 {
+                            viewport.min.y += crate::theme::TOP_BAR_HEIGHT / 2.0 + 12.0;
+                        }
+                        assert_eq!(
+                            response.interact_rect, response.rect,
+                            "{page}, macOS={macos}, reverse={reverse}: {stop:?} is fully visible"
+                        );
+                        assert!(
+                            viewport.contains_rect(response.rect),
+                            "{stop:?} stays in the rail below the title bar"
+                        );
+                        reached.insert(stop);
+                    }
+                    assert_eq!(reached, expected.into_iter().collect());
+                }
+            }
+        }
+    }
+
+    /// Wheel scrolling reaches the account button at the minimum height;
+    /// growing the window restores the usual top and bottom positions.
+    #[test]
+    fn a_short_rail_scrolls_and_resets_when_the_window_grows() {
+        for macos in [false, true] {
+            for page in ["chat", "rail"] {
+                let (mut app, ctx) = open(page, macos);
+                let chats = destination_rect(&ctx, Destination::Chats);
+                let profile = stop_rect(&ctx, Stop::Profile).unwrap();
+                let size = egui::vec2(1180.0, 300.0);
+                for _ in 0..3 {
+                    frame_at(&mut app, &ctx, size, Vec::new());
+                }
+                assert!(stop_rect(&ctx, Stop::Profile).unwrap().bottom() > size.y);
+                let pointer = destination_rect(&ctx, Destination::Calls).center();
+                frame_at(
+                    &mut app,
+                    &ctx,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(pointer),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -600.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ],
+                );
+                for _ in 0..30 {
+                    frame_at(&mut app, &ctx, size, Vec::new());
+                }
+                let id = focus::control(&ctx, Stop::Profile).unwrap();
+                let response = ctx.read_response(id).unwrap();
+                assert_eq!(
+                    response.interact_rect, response.rect,
+                    "{page}, macOS={macos}: the account button is fully visible after scrolling"
+                );
+                assert!(rail_rect(&ctx).unwrap().contains_rect(response.rect));
+                for _ in 0..3 {
+                    frame(&mut app, &ctx, 1180.0, Vec::new());
+                }
+                assert_eq!(destination_rect(&ctx, Destination::Chats), chats);
+                assert_eq!(stop_rect(&ctx, Stop::Profile), Some(profile));
+            }
         }
     }
 

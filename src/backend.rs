@@ -439,7 +439,8 @@ pub enum Command {
         samples: Vec<f32>,
         quoting: Option<crate::model::ReplyTarget>,
     },
-    /// Places a 1:1 call, offering video from the first frame when asked.
+    /// Places a 1:1 call, or starts a call in a group for a group chat, offering video from the
+    /// first frame when asked.
     ///
     /// `generation` is the one the window already drew the call under, and `cancel` is set when
     /// the reader hangs up before the offer has gone out, so the peer is never rung for it.
@@ -541,6 +542,11 @@ pub enum Command {
     },
     /// Asks for an audio file for one chat's notifications.
     PickChatSound(ChatId),
+    /// Stores a chat's own voice message speed.
+    SetChatVoiceSpeed {
+        chat: ChatId,
+        speed: Option<f32>,
+    },
     /// Asks for a folder for new downloads.
     PickDownloadFolder,
     /// Asks for a wallpaper image and copies it into the state directory.
@@ -945,6 +951,12 @@ pub enum Command {
     },
     /// Internal: followed channels and whether each is muted on the server.
     ChannelMutes(Vec<(String, bool)>),
+    /// Internal: every followed channel and the name the server gives it
+    /// (blank when it has none), from the query numbered `generation`.
+    ChannelNames {
+        generation: u64,
+        names: Vec<(String, String)>,
+    },
     /// Internal: the pictures of followed channels, or `None` when the list
     /// could not be read.
     ChannelPictures(Option<Vec<(ChatId, ChannelPicture)>>),
@@ -1246,6 +1258,10 @@ pub enum Event {
     },
     /// The current call changed state. The UI renders this and nothing else.
     Call(Box<crate::calls::CallUpdate>),
+    /// A group call ZapFast cannot join while [`crate::calls::GROUP_CALLS_ENABLED`] is off:
+    /// ringing (`phase` is `Incoming`), so the window says who is calling and to answer on the
+    /// phone, or over, so that word is taken back. It never takes the call screen.
+    PhoneOnlyCall(Box<crate::calls::CallUpdate>),
     /// The devices the call screen can offer.
     CallDevices(Box<crate::calls::DeviceList>),
     /// The account's call entries, newest first, for the Calls page.

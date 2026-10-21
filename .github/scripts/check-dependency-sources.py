@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fails when a dependency comes from a source the maintainer does not control.
+"""Fails when a dependency comes from a source the maintainer has not approved.
 
 Crates come from crates.io. A git dependency or a [patch] entry may only name
-a repository under https://github.com/crmne/, and adding or changing one needs
-the maintainer's approval (CONTRIBUTING.md, "Design principles"). This reads every
+a repository under https://github.com/crmne/ or the explicitly approved upstream
+https://github.com/oxidezap/whatsapp-rust. Adding or changing one still needs the
+maintainer's approval (CONTRIBUTING.md, "Design principles"). This reads every
 tracked Cargo.toml, Cargo.lock and .cargo/config.toml.
 """
 
@@ -21,15 +22,15 @@ CRATES_IO = {
 MANIFESTS = ("/Cargo.toml", "/Cargo.lock", "/.cargo/config.toml", "/.cargo/config")
 
 
-def owned(url):
-    """True for https://github.com/crmne/<repository> and nothing else."""
+def allowed_git_source(url):
+    """True for maintainer repositories and the approved WhatsApp upstream."""
     parts = urlsplit(url)
     segments = parts.path.strip("/").removesuffix(".git").split("/")
     return (
         parts.scheme == "https"
         and parts.netloc == "github.com"
         and len(segments) == 2
-        and segments[0] == "crmne"
+        and (segments[0] == "crmne" or segments == ["oxidezap", "whatsapp-rust"])
         and segments[1] not in ("", ".", "..")
         and "%" not in parts.path
     )
@@ -65,15 +66,15 @@ def problems(files):
         if path.endswith("Cargo.lock"):
             for package in data.get("package", []):
                 source = package.get("source")
-                if source and source not in CRATES_IO and not (source.startswith("git+") and owned(source[4:])):
+                if source and source not in CRATES_IO and not (source.startswith("git+") and allowed_git_source(source[4:])):
                     found.append((path, f"{package['name']} comes from {source}"))
             continue
         for table, url in git_urls(data):
-            if not owned(url):
+            if not allowed_git_source(url):
                 found.append((path, f"{table} points at {url}"))
         for section, crate, spec in replacements(data):
             if not (isinstance(spec, dict) and "git" in spec):
-                found.append((path, f"[{section}] {crate} must name a git repository under https://github.com/crmne/"))
+                found.append((path, f"[{section}] {crate} must name an approved git repository; see CONTRIBUTING.md"))
         for section in ("source", "registries"):
             if section in data:
                 found.append((path, f"[{section}] adds a crate source besides crates.io"))
@@ -92,7 +93,8 @@ def main():
         print(f"::error file={path}::{message}" if os.environ.get("GITHUB_ACTIONS") else f"{path}: {message}")
     if found:
         print(
-            "Dependencies come from crates.io or from repositories under https://github.com/crmne/. "
+            "Dependencies come from crates.io, repositories under https://github.com/crmne/, "
+            "or the approved upstream https://github.com/oxidezap/whatsapp-rust. "
             "Send a dependency fix upstream and ask the maintainer to carry it; see CONTRIBUTING.md, Design principles."
         )
     return 1 if found else 0

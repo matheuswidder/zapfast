@@ -16,7 +16,7 @@ finish-args:
   # Archive encryption key.
   - --talk-name=org.freedesktop.secrets
   - --talk-name=org.kde.StatusNotifierWatcher
-  # Desktop notifications, which notify-rust sends straight to the server.
+  # Desktop notifications, which Fastframe sends straight to the server.
   - --talk-name=org.freedesktop.Notifications
   - --persist=.local/state
 modules:

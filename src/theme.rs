@@ -1261,6 +1261,23 @@ fn focus_outline_on_fill(
 /// this itself, and a scroll target only counts when set while the widget's
 /// scroll area is being laid out, so each focusable widget calls this.
 pub fn reveal_focus(response: &Response) {
+    reveal_focus_aligned(response, None);
+}
+
+/// [`reveal_focus`] for a widget in `ui`'s scroll area that may be too short
+/// for the margin egui keeps around a scroll target (ours, and the item
+/// spacing at each end): there egui would line the margin up with the top
+/// and leave the widget's foot cut off, so the widget is centred instead.
+pub fn reveal_focus_in(ui: &egui::Ui, response: &Response) {
+    let margin = 2.0 * (FOCUS_SCROLL_MARGIN + ui.spacing().item_spacing.y);
+    let short = response.rect.height() + margin > ui.clip_rect().height();
+    reveal_focus_aligned(response, short.then_some(egui::Align::Center));
+}
+
+/// Room kept around a widget [`reveal_focus`] scrolls into view.
+const FOCUS_SCROLL_MARGIN: f32 = 4.0;
+
+fn reveal_focus_aligned(response: &Response, align: Option<egui::Align>) {
     let keyboard = response
         .ctx
         .data(|data| data.get_temp::<bool>(keyboard_focus_id()).unwrap_or(false));
@@ -1271,8 +1288,8 @@ pub fn reveal_focus(response: &Response) {
         // A small margin avoids subpixel clipping when scroll offsets round to
         // device pixels, and leaves room for the focus stroke.
         let mut target = response.clone();
-        target.rect = target.rect.expand(4.0);
-        target.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+        target.rect = target.rect.expand(FOCUS_SCROLL_MARGIN);
+        target.scroll_to_me_animation(align, egui::style::ScrollAnimation::none());
     }
 }
 
