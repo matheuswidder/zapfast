@@ -3492,6 +3492,37 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     working: false,
                 });
             }
+            "tts-remote" => {
+                app.settings.tts_enabled = true;
+                app.settings.tts_source = crate::settings::TtsSource::Remote;
+                app.settings.tts_endpoint = "https://proxy.widder.cloud/v1".to_owned();
+                app.settings.tts_voice = "flatt/deepseek-v4.1-flash-1017".to_owned();
+                app.tts_token = "sk-1234567890abcdef1234567890abcdef".to_owned();
+                app.tts_token_draft = app.tts_token.clone();
+                app.synthesizer
+                    .seed_remote_models(crate::tts::RemoteModelsState::Loaded(vec![
+                        crate::tts::RemoteModel {
+                            id: "flatt/deepseek-v4.1-flash-1017".to_owned(),
+                            owned_by: "flatt".to_owned(),
+                        },
+                        crate::tts::RemoteModel {
+                            id: "ag/gemini-3.8-flash".to_owned(),
+                            owned_by: "ag".to_owned(),
+                        },
+                        crate::tts::RemoteModel {
+                            id: "ag/gemini-3.8-flash-high".to_owned(),
+                            owned_by: "ag".to_owned(),
+                        },
+                        crate::tts::RemoteModel {
+                            id: "edge-tts/pt-BR-ThalitaMultilingualNeural".to_owned(),
+                            owned_by: "edge-tts".to_owned(),
+                        },
+                        crate::tts::RemoteModel {
+                            id: "edge-tts/pt-BR-AntonioNeural".to_owned(),
+                            owned_by: "edge-tts".to_owned(),
+                        },
+                    ]));
+            }
             // Shows the native image preview over the demo chat.
             "preview" => {
                 // Three photos with a text between the second and the third,

@@ -174,7 +174,116 @@ pub fn estimate_seconds(text: &str) -> u32 {
 /// The service the remote source talks to unless the settings say
 /// otherwise. It speaks the OpenAI audio API, the same one the radialista
 /// agent uses.
-pub const DEFAULT_ENDPOINT: &str = "https://proxy.widder.cloud/v1/audio/speech";
+pub const DEFAULT_ENDPOINT: &str = "https://proxy.widder.cloud/v1";
+
+/// A model offered by an OpenAI-compatible remote endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteModel {
+    pub id: String,
+    pub owned_by: String,
+}
+
+/// The state of fetching models from a remote endpoint.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RemoteModelsState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded(Vec<RemoteModel>),
+    Failed(String),
+}
+
+/// The speech URL derived from an endpoint (whether base /v1 or /v1/audio/speech).
+pub fn speech_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.ends_with("/audio/speech") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/audio/speech")
+    }
+}
+
+/// The models URL derived from an endpoint.
+pub fn models_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let base = if trimmed.ends_with("/audio/speech") {
+        trimmed
+            .trim_end_matches("/audio/speech")
+            .trim_end_matches('/')
+    } else {
+        trimmed
+    };
+    format!("{base}/models")
+}
+
+/// Queries the models endpoint of an OpenAI-compatible server.
+pub fn fetch_remote_models(
+    endpoint: &str,
+    token: Option<&str>,
+) -> Result<Vec<RemoteModel>, String> {
+    let url = models_url(endpoint);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut builder = client.get(&url);
+    if let Some(token) = token.filter(|t| !t.trim().is_empty()) {
+        builder = builder.bearer_auth(token.trim());
+    }
+    let response = builder
+        .send()
+        .map_err(|e| format!("the endpoint did not answer: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("the endpoint answered {}", response.status()));
+    }
+    let raw = response
+        .text()
+        .map_err(|e| format!("failed to read response text: {e}"))?;
+    let body: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid JSON from models endpoint: {e}"))?;
+
+    let mut models = Vec::new();
+    if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+        for item in data {
+            if let Some(id) = item.get("id").and_then(|id| id.as_str()) {
+                let owner = item
+                    .get("owned_by")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or("openai");
+                models.push(RemoteModel {
+                    id: id.to_owned(),
+                    owned_by: owner.to_owned(),
+                });
+            }
+        }
+    } else if let Some(arr) = body.as_array() {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(|id| id.as_str()) {
+                let owner = item
+                    .get("owned_by")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or("openai");
+                models.push(RemoteModel {
+                    id: id.to_owned(),
+                    owned_by: owner.to_owned(),
+                });
+            }
+        }
+    }
+
+    // Always include the core Edge-TTS voices under "edge-tts"
+    // so users targeting 9Router or Edge proxies can select them directly.
+    for remote in REMOTE_VOICES {
+        if !models.iter().any(|m| m.id == remote.model) {
+            models.push(RemoteModel {
+                id: remote.model.to_owned(),
+                owned_by: "edge-tts".to_owned(),
+            });
+        }
+    }
+
+    Ok(models)
+}
 
 /// Where the service's token is filed in the OS keyring.
 pub const TTS_TOKEN: &str = "tts-token";
@@ -314,6 +423,7 @@ pub struct Request {
 pub struct Synthesizer {
     states: Arc<Mutex<HashMap<String, SpeakState>>>,
     downloads: Arc<Mutex<HashMap<String, crate::transcription::DownloadState>>>,
+    remote_models: Arc<Mutex<RemoteModelsState>>,
     queue: Mutex<Sender<Request>>,
     /// Grows every time a speech lands, so a frame that missed the wake can
     /// still tell.
@@ -326,6 +436,7 @@ impl Synthesizer {
         let (sender, receiver) = std::sync::mpsc::channel::<Request>();
         let states = Arc::new(Mutex::new(HashMap::new()));
         let downloads = Arc::new(Mutex::new(HashMap::new()));
+        let remote_models = Arc::new(Mutex::new(RemoteModelsState::Idle));
         let revision = Arc::new(AtomicU64::new(0));
         let worker_states = Arc::clone(&states);
         let worker_revision = Arc::clone(&revision);
@@ -361,9 +472,51 @@ impl Synthesizer {
         Self {
             states,
             downloads,
+            remote_models,
             queue: Mutex::new(sender),
             revision,
         }
+    }
+
+    /// The current state of remote models discovered from the endpoint.
+    pub fn remote_models(&self) -> RemoteModelsState {
+        self.remote_models
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Seeds remote models for demos or tests.
+    pub fn seed_remote_models(&self, state: RemoteModelsState) {
+        let mut models = self.remote_models.lock().unwrap_or_else(|p| p.into_inner());
+        *models = state;
+    }
+
+    /// Fetches the available models from the remote endpoint in a background thread.
+    pub fn fetch_models(&self, endpoint: String, token: Option<String>, waker: Waker) {
+        let models_store = Arc::clone(&self.remote_models);
+        {
+            let mut state = models_store.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(*state, RemoteModelsState::Loading) {
+                return;
+            }
+            *state = RemoteModelsState::Loading;
+        }
+        waker.wake();
+
+        std::thread::Builder::new()
+            .name("tts-fetch-models".to_owned())
+            .spawn(move || {
+                let result = fetch_remote_models(&endpoint, token.as_deref());
+                let mut state = models_store.lock().unwrap_or_else(|p| p.into_inner());
+                match result {
+                    Ok(models) => *state = RemoteModelsState::Loaded(models),
+                    Err(error) => *state = RemoteModelsState::Failed(error),
+                }
+                drop(state);
+                waker.wake();
+            })
+            .expect("spawns tts-fetch-models thread");
     }
 
     /// Queues a text to be spoken.
@@ -694,7 +847,8 @@ fn speak_remote(request: &Request) -> Result<Vec<u8>, String> {
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|error| error.to_string())?;
-    let mut builder = client.post(endpoint);
+    let target_url = speech_url(endpoint);
+    let mut builder = client.post(&target_url);
     if let Some(key) = request.key.as_deref().filter(|key| !key.is_empty()) {
         builder = builder.bearer_auth(key);
     }
@@ -774,9 +928,22 @@ mod tests {
 
     #[test]
     fn the_endpoint_is_the_one_the_radialista_uses() {
+        assert_eq!(DEFAULT_ENDPOINT, "https://proxy.widder.cloud/v1");
         assert_eq!(
-            DEFAULT_ENDPOINT,
+            speech_url("https://proxy.widder.cloud/v1"),
             "https://proxy.widder.cloud/v1/audio/speech"
+        );
+        assert_eq!(
+            speech_url("https://proxy.widder.cloud/v1/audio/speech"),
+            "https://proxy.widder.cloud/v1/audio/speech"
+        );
+        assert_eq!(
+            models_url("https://proxy.widder.cloud/v1"),
+            "https://proxy.widder.cloud/v1/models"
+        );
+        assert_eq!(
+            models_url("https://proxy.widder.cloud/v1/audio/speech"),
+            "https://proxy.widder.cloud/v1/models"
         );
     }
 

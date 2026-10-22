@@ -1028,26 +1028,20 @@ fn sections(app: &App) -> Vec<Section> {
                 theme::reveal_focus(&response.response);
             },
         );
-        extensions.row(
-            translated(locale, "Voice"),
-            translated(locale, "The voice that speaks the text."),
-            move |ui, app| {
-                let palette = app.palette;
-                let source = app.settings.tts_source;
-                let voice = app.settings.tts_voice.clone();
-                let selected = match source {
-                    crate::settings::TtsSource::Local => crate::tts::local_voice_by_key(&voice)
+        if app.settings.tts_source == crate::settings::TtsSource::Local {
+            extensions.row(
+                translated(locale, "Voice"),
+                translated(locale, "The voice that speaks the text."),
+                move |ui, app| {
+                    let palette = app.palette;
+                    let voice = app.settings.tts_voice.clone();
+                    let selected = crate::tts::local_voice_by_key(&voice)
                         .map(|found| found.label(locale))
-                        .unwrap_or_else(|| crate::tts::LOCAL_VOICES[0].label(locale)),
-                    crate::settings::TtsSource::Remote => crate::tts::remote_voice_by_name(&voice)
-                        .map(|found| found.label(locale))
-                        .unwrap_or_else(|| crate::tts::REMOTE_VOICES[0].label(locale)),
-                };
-                let response = egui::ComboBox::from_id_salt("tts_voice")
-                    .selected_text(selected)
-                    .width(220.0_f32.min(ui.available_width()))
-                    .show_ui(ui, |ui| match source {
-                        crate::settings::TtsSource::Local => {
+                        .unwrap_or_else(|| crate::tts::LOCAL_VOICES[0].label(locale));
+                    let response = egui::ComboBox::from_id_salt("tts_voice")
+                        .selected_text(selected)
+                        .width(220.0_f32.min(ui.available_width()))
+                        .show_ui(ui, |ui| {
                             for option in crate::tts::LOCAL_VOICES {
                                 if theme_option(
                                     ui,
@@ -1058,25 +1052,10 @@ fn sections(app: &App) -> Vec<Section> {
                                     app.actions.push(Action::SetTtsVoice(option.key.to_owned()));
                                 }
                             }
-                        }
-                        crate::settings::TtsSource::Remote => {
-                            for option in crate::tts::REMOTE_VOICES {
-                                if theme_option(
-                                    ui,
-                                    &palette,
-                                    &option.label(locale),
-                                    option.name == voice,
-                                ) {
-                                    app.actions
-                                        .push(Action::SetTtsVoice(option.name.to_owned()));
-                                }
-                            }
-                        }
-                    });
-                theme::reveal_focus(&response.response);
-            },
-        );
-        if app.settings.tts_source == crate::settings::TtsSource::Local {
+                        });
+                    theme::reveal_focus(&response.response);
+                },
+            );
             extensions.block(
                 vec![
                     translated(locale, "Piper"),
@@ -1094,55 +1073,14 @@ fn sections(app: &App) -> Vec<Section> {
                 tts_voice_models,
             );
         } else {
-            extensions.row(
-                translated(locale, "Service address"),
-                translated(locale, "Where the text is sent to be spoken."),
-                move |ui, app| {
-                    let palette = app.palette;
-                    let mut endpoint = app.settings.tts_endpoint.clone();
-                    let response = egui::TextEdit::singleline(&mut endpoint)
-                        .id(egui::Id::new("tts_endpoint"))
-                        .desired_width(f32::INFINITY)
-                        .text_color(palette.text)
-                        .show(ui);
-                    if response.response.changed() {
-                        app.actions.push(Action::SetTtsEndpoint(endpoint));
-                    }
-                },
-            );
-            extensions.row(
-                translated(locale, "Service token"),
-                translated(
-                    locale,
-                    "Kept in the OS keyring, never in the settings file.",
-                ),
-                move |ui, app| {
-                    use crate::i18n::gettext;
-                    let palette = app.palette;
-                    ui.horizontal(|ui| {
-                        let width = (220.0_f32 - 76.0).max(140.0).min(ui.available_width());
-                        let response = egui::TextEdit::singleline(&mut app.tts_token)
-                            .id(egui::Id::new("tts_token"))
-                            .desired_width(width)
-                            .password(true)
-                            .text_color(palette.text)
-                            .hint_text(
-                                egui::RichText::new(
-                                    gettext(locale, "The service's token").into_owned(),
-                                )
-                                .color(palette.dim),
-                            )
-                            .show(ui);
-                        if response.response.changed() {
-                            app.actions.push(Action::SetTtsKey(app.tts_token.clone()));
-                        }
-                        if theme::soft_button(ui, &palette, None, &gettext(locale, "Save"), false)
-                            .clicked()
-                        {
-                            app.actions.push(Action::SetTtsKey(app.tts_token.clone()));
-                        }
-                    });
-                },
+            extensions.block(
+                vec![
+                    translated(locale, "Endpoint URL"),
+                    translated(locale, "API key (optional)"),
+                    translated(locale, "Available models"),
+                    "OpenAI".into(),
+                ],
+                remote_tts_service_block,
             );
         }
     }
@@ -1458,6 +1396,363 @@ fn tts_piper_runtime(ui: &mut egui::Ui, app: &mut App) {
             );
         }
     });
+}
+
+/// Masks a secret token for locked presentation (e.g. `sk-...e63b`).
+fn mask_token(token: &str) -> String {
+    let t = token.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if t.len() <= 8 {
+        return "••••••••".to_owned();
+    }
+    let prefix = &t[..3.min(t.len())];
+    let suffix = &t[t.len().saturating_sub(4)..];
+    format!("{prefix}...{suffix}")
+}
+
+/// Settings block for configuring an OpenAI-compatible remote speech service,
+/// managing credentials and discovering available models.
+fn remote_tts_service_block(ui: &mut egui::Ui, app: &mut App) {
+    use crate::i18n::gettext;
+    let palette = app.palette;
+    let locale = app.locale;
+
+    // 1. URL do endpoint
+    theme::text(
+        ui,
+        gettext(locale, "Endpoint URL"),
+        theme::semibold(13.0),
+        palette.text,
+    );
+    ui.add_space(4.0);
+    let mut endpoint = app.settings.tts_endpoint.clone();
+    let resp = egui::TextEdit::singleline(&mut endpoint)
+        .id(egui::Id::new("tts_endpoint_input"))
+        .desired_width(f32::INFINITY)
+        .text_color(palette.text)
+        .show(ui);
+    if resp.response.changed() {
+        app.actions.push(Action::SetTtsEndpoint(endpoint));
+    }
+    ui.add_space(2.0);
+    theme::text(
+        ui,
+        gettext(
+            locale,
+            "Point to an OpenAI-compatible server on your local network (e.g.: Ollama, LM Studio, vLLM or llama-server).",
+        ),
+        theme::regular(11.5),
+        palette.secondary,
+    );
+
+    ui.add_space(14.0);
+
+    // 2. Chave API (opcional)
+    theme::text(
+        ui,
+        gettext(locale, "API key (optional)"),
+        theme::semibold(13.0),
+        palette.text,
+    );
+    ui.add_space(4.0);
+    let key_is_saved = !app.tts_token.trim().is_empty();
+    if !app.tts_key_editing && key_is_saved {
+        let frame = Frame::new()
+            .fill(palette.surface)
+            .stroke(Stroke::new(1.0, palette.outline))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::symmetric(10, 6));
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                theme::icon(ui, Icon::Lock, 13.0, palette.secondary);
+                ui.add_space(4.0);
+                let masked = mask_token(&app.tts_token);
+                theme::text(ui, masked, theme::regular(13.0), palette.text);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Pencil),
+                        &gettext(locale, "Edit"),
+                        false,
+                    )
+                    .clicked()
+                    {
+                        app.tts_key_editing = true;
+                        app.tts_token_draft = app.tts_token.clone();
+                    }
+                });
+            });
+        });
+    } else {
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 140.0).max(120.0);
+            let resp = egui::TextEdit::singleline(&mut app.tts_token_draft)
+                .id(egui::Id::new("tts_token_draft_input"))
+                .password(true)
+                .desired_width(width)
+                .hint_text(
+                    egui::RichText::new("sk-...")
+                        .color(palette.dim)
+                        .font(theme::regular(13.0)),
+                )
+                .text_color(palette.text)
+                .show(ui);
+            let _ = resp;
+            if theme::pill_button(ui, &palette, &gettext(locale, "Save"), true).clicked() {
+                app.actions
+                    .push(Action::SetTtsKey(app.tts_token_draft.clone()));
+                app.tts_key_editing = false;
+            }
+            if key_is_saved
+                && theme::soft_button(ui, &palette, None, &gettext(locale, "Cancel"), false)
+                    .clicked()
+            {
+                app.tts_token_draft = app.tts_token.clone();
+                app.tts_key_editing = false;
+            }
+        });
+    }
+    ui.add_space(2.0);
+    theme::text(
+        ui,
+        gettext(
+            locale,
+            "Optional. Sent as Bearer token for authentication. Separate from your OpenAI API key.",
+        ),
+        theme::regular(11.5),
+        palette.secondary,
+    );
+
+    ui.add_space(14.0);
+
+    // 3. Modelos disponíveis
+    let models_state = app.synthesizer.remote_models();
+    let is_loading = matches!(models_state, crate::tts::RemoteModelsState::Loading);
+
+    ui.horizontal(|ui| {
+        theme::text(
+            ui,
+            gettext(locale, "Available models"),
+            theme::semibold(13.0),
+            palette.text,
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if is_loading {
+                theme::spinner(ui, 13.0, palette.accent);
+                ui.add_space(4.0);
+                theme::text(
+                    ui,
+                    gettext(locale, "Fetching..."),
+                    theme::regular(11.5),
+                    palette.secondary,
+                );
+            } else if theme::soft_button(
+                ui,
+                &palette,
+                Some(Icon::Refresh),
+                &gettext(locale, "Refresh"),
+                false,
+            )
+            .clicked()
+            {
+                app.actions.push(Action::FetchRemoteTtsModels);
+            }
+        });
+    });
+
+    let models_url_str = crate::tts::models_url(&app.settings.tts_endpoint);
+    let subtext =
+        gettext(locale, "We will consult {} for available models.").replace("{}", &models_url_str);
+    ui.add_space(2.0);
+    theme::text(ui, subtext, theme::regular(11.5), palette.secondary);
+
+    ui.add_space(8.0);
+
+    // Search bar
+    ui.horizontal(|ui| {
+        theme::icon(ui, Icon::Search, 14.0, palette.secondary);
+        egui::TextEdit::singleline(&mut app.remote_models_filter)
+            .id(egui::Id::new("remote_models_search"))
+            .hint_text(
+                egui::RichText::new(gettext(locale, "Search models..."))
+                    .color(palette.dim)
+                    .font(theme::regular(12.5)),
+            )
+            .desired_width(f32::INFINITY)
+            .text_color(palette.text)
+            .show(ui);
+    });
+
+    ui.add_space(8.0);
+
+    // Auto-fetch if idle
+    if matches!(models_state, crate::tts::RemoteModelsState::Idle) {
+        app.actions.push(Action::FetchRemoteTtsModels);
+    }
+
+    match models_state {
+        crate::tts::RemoteModelsState::Idle | crate::tts::RemoteModelsState::Loading => {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                theme::spinner(ui, 14.0, palette.accent);
+                ui.add_space(6.0);
+                theme::text(
+                    ui,
+                    gettext(locale, "Fetching available models..."),
+                    theme::regular(12.0),
+                    palette.secondary,
+                );
+            });
+            ui.add_space(10.0);
+        }
+        crate::tts::RemoteModelsState::Failed(ref err) => {
+            ui.add_space(6.0);
+            let frame = Frame::new()
+                .fill(palette.surface)
+                .stroke(Stroke::new(1.0, palette.danger.gamma_multiply(0.5)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(8));
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::icon(ui, Icon::CircleX, 14.0, palette.danger);
+                    ui.add_space(4.0);
+                    let msg = format!("{}: {}", gettext(locale, "Failed to load models"), err);
+                    theme::text(ui, msg, theme::regular(12.0), palette.danger);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::soft_button(ui, &palette, None, &gettext(locale, "Retry"), false)
+                            .clicked()
+                        {
+                            app.actions.push(Action::FetchRemoteTtsModels);
+                        }
+                    });
+                });
+            });
+        }
+        crate::tts::RemoteModelsState::Loaded(ref models) => {
+            let active_voice = app.settings.tts_voice.clone();
+            let query = app.remote_models_filter.trim().to_lowercase();
+
+            ui.vertical(|ui| {
+                // 1. SELECIONADO 1
+                if let Some(active_model) = models.iter().find(|m| m.id == active_voice) {
+                    let sel_title = format!("{} 1", gettext(locale, "SELECTED"));
+                    theme::text(ui, sel_title, theme::semibold(10.5), palette.accent);
+                    ui.add_space(3.0);
+                    let sel_frame = Frame::new()
+                        .fill(palette.surface_active)
+                        .stroke(Stroke::new(1.0, palette.accent))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(10, 7));
+                    sel_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                            ui.painter()
+                                .circle_filled(dot_rect.center(), 3.0, palette.accent);
+                            ui.add_space(2.0);
+                            theme::icon(ui, Icon::Volume2, 14.0, palette.accent);
+                            ui.add_space(4.0);
+                            theme::text(ui, &active_model.id, theme::semibold(12.5), palette.text);
+                            ui.add_space(6.0);
+                            let owner_text =
+                                format!("{}: {}", gettext(locale, "Owner"), active_model.owned_by);
+                            theme::text(ui, owner_text, theme::regular(11.0), palette.dim);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                theme::pill_button(ui, &palette, &gettext(locale, "Active"), true);
+                            });
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+
+                // 2. Grouped models
+                let filtered: Vec<&crate::tts::RemoteModel> = models
+                    .iter()
+                    .filter(|m| {
+                        query.is_empty()
+                            || m.id.to_lowercase().contains(&query)
+                            || m.owned_by.to_lowercase().contains(&query)
+                    })
+                    .collect();
+
+                let mut groups: std::collections::BTreeMap<&str, Vec<&crate::tts::RemoteModel>> =
+                    std::collections::BTreeMap::new();
+                for m in &filtered {
+                    groups.entry(m.owned_by.as_str()).or_default().push(m);
+                }
+
+                for (owner, group_models) in groups {
+                    let header_text = format!("{} {}", owner.to_uppercase(), group_models.len());
+                    theme::text(ui, header_text, theme::semibold(10.5), palette.secondary);
+                    ui.add_space(3.0);
+
+                    for m in group_models {
+                        let is_this_active = m.id == active_voice;
+                        let (rect, resp) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                CornerRadius::same(5),
+                                palette.surface_hover,
+                            );
+                        }
+                        let content_rect = rect.shrink2(vec2(8.0, 4.0));
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(content_rect)
+                                .layout(Layout::left_to_right(Align::Center)),
+                            |ui| {
+                                let dot_color = if is_this_active {
+                                    palette.accent
+                                } else {
+                                    palette.secondary.gamma_multiply(0.5)
+                                };
+                                let (dot_rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                ui.painter()
+                                    .circle_filled(dot_rect.center(), 2.5, dot_color);
+                                ui.add_space(4.0);
+                                theme::text(
+                                    ui,
+                                    &m.id,
+                                    if is_this_active {
+                                        theme::semibold(12.5)
+                                    } else {
+                                        theme::regular(12.5)
+                                    },
+                                    palette.text,
+                                );
+                                ui.add_space(6.0);
+                                let owner_text =
+                                    format!("{}: {}", gettext(locale, "Owner"), m.owned_by);
+                                theme::text(ui, owner_text, theme::regular(11.0), palette.dim);
+                                if is_this_active {
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        theme::text(
+                                            ui,
+                                            gettext(locale, "Active"),
+                                            theme::semibold(11.0),
+                                            palette.accent,
+                                        );
+                                    });
+                                }
+                            },
+                        );
+                        if resp.clicked() {
+                            app.actions.push(Action::SetTtsVoice(m.id.clone()));
+                        }
+                        ui.add_space(2.0);
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        }
+    }
 }
 
 /// The Whisper models of the Transcription extension: sizes, download

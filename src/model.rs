@@ -2606,6 +2606,8 @@ pub enum Action {
     SetTtsEndpoint(String),
     /// Stores the service's token in the OS keyring.
     SetTtsKey(String),
+    /// Queries the models endpoint of the remote speech service.
+    FetchRemoteTtsModels,
     /// Speaks a text and leaves the speech ready to be listened to.
     SpeakTts {
         chat: String,

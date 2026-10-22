@@ -580,6 +580,12 @@ pub struct App {
     /// Token for the remote speech service, kept in memory and mirrored to
     /// the OS keyring.
     pub tts_token: String,
+    /// Draft token being edited in settings.
+    pub tts_token_draft: String,
+    /// Whether the token field in settings is currently unlocked for editing.
+    pub tts_key_editing: bool,
+    /// Search filter for the remote models list in settings.
+    pub remote_models_filter: String,
     /// Counts the TTS requests, so each one gets a name of its own.
     next_tts_id: u64,
     /// In-chat video player.
@@ -1434,6 +1440,11 @@ impl App {
                     }
                 })
                 .unwrap_or_default(),
+            tts_token_draft: crate::secret::load(crate::tts::TTS_TOKEN)
+                .filter(|k| !k.trim().is_empty())
+                .unwrap_or_default(),
+            tts_key_editing: false,
+            remote_models_filter: String::new(),
             next_tts_id: 0,
             video: crate::video::Player::new(waker.clone()),
             video_chat: None,
@@ -7342,13 +7353,26 @@ impl App {
                 self.mark_settings_dirty();
             }
             Action::SetTtsKey(key) => {
-                self.tts_token = key.clone();
+                let trimmed = key.trim().to_owned();
+                self.tts_token = trimmed.clone();
+                self.tts_token_draft = trimmed.clone();
+                self.tts_key_editing = false;
                 // The token lives in the OS keyring, not in the settings file.
-                if key.trim().is_empty() {
+                if trimmed.is_empty() {
                     let _ = crate::secret::forget(crate::tts::TTS_TOKEN);
-                } else if let Err(error) = crate::secret::store(crate::tts::TTS_TOKEN, &key) {
+                } else if let Err(error) = crate::secret::store(crate::tts::TTS_TOKEN, &trimmed) {
                     self.toast_error(error);
                 }
+            }
+            Action::FetchRemoteTtsModels => {
+                let endpoint = self.settings.tts_endpoint.clone();
+                let token = if !self.tts_token.trim().is_empty() {
+                    Some(self.tts_token.trim().to_owned())
+                } else {
+                    crate::secret::load(crate::tts::TTS_TOKEN)
+                };
+                self.synthesizer
+                    .fetch_models(endpoint, token, self.waker.clone());
             }
             Action::OpenTts => {
                 if let Some(chat) = self.open_chat.clone() {
@@ -9603,7 +9627,15 @@ impl App {
                 }
             }
             crate::settings::TtsSource::Remote => {
-                let voice = crate::tts::selected_remote_voice(&self.settings);
+                let voice = if let Some(preset) =
+                    crate::tts::remote_voice_by_name(&self.settings.tts_voice)
+                {
+                    preset.model.to_owned()
+                } else if !self.settings.tts_voice.trim().is_empty() {
+                    self.settings.tts_voice.trim().to_owned()
+                } else {
+                    crate::tts::REMOTE_VOICES[0].model.to_owned()
+                };
                 crate::tts::Request {
                     id: id.clone(),
                     text: text.clone(),
@@ -9611,7 +9643,7 @@ impl App {
                     piper: None,
                     model: None,
                     endpoint: Some(self.settings.tts_endpoint.clone()),
-                    voice: Some(voice.model.to_owned()),
+                    voice: Some(voice),
                     key: if !self.tts_token.trim().is_empty() {
                         Some(self.tts_token.trim().to_owned())
                     } else {

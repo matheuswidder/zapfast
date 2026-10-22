@@ -2181,7 +2181,6 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
         let error = draft.error.clone();
         let source = app.settings.tts_source;
         let voice = app.settings.tts_voice.clone();
-        let endpoint = app.settings.tts_endpoint.clone();
         widgets::raised(ui, &palette, strip_frame(&palette), |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2283,7 +2282,13 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                         .unwrap_or_else(|| crate::tts::LOCAL_VOICES[0].label(locale)),
                     crate::settings::TtsSource::Remote => crate::tts::remote_voice_by_name(&voice)
                         .map(|found| found.label(locale))
-                        .unwrap_or_else(|| crate::tts::REMOTE_VOICES[0].label(locale)),
+                        .unwrap_or_else(|| {
+                            if !voice.trim().is_empty() {
+                                voice.clone()
+                            } else {
+                                crate::tts::REMOTE_VOICES[0].label(locale)
+                            }
+                        }),
                 };
                 let response = egui::ComboBox::from_id_salt("tts-voice")
                     .selected_text(selected)
@@ -2302,15 +2307,25 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                             }
                         }
                         crate::settings::TtsSource::Remote => {
-                            for option in crate::tts::REMOTE_VOICES {
-                                if theme_option(
-                                    ui,
-                                    &palette,
-                                    &option.label(locale),
-                                    option.name == voice,
-                                ) {
-                                    app.actions
-                                        .push(Action::SetTtsVoice(option.name.to_owned()));
+                            let models_state = app.synthesizer.remote_models();
+                            if let crate::tts::RemoteModelsState::Loaded(ref models) = models_state
+                            {
+                                for m in models {
+                                    if theme_option(ui, &palette, &m.id, m.id == voice) {
+                                        app.actions.push(Action::SetTtsVoice(m.id.clone()));
+                                    }
+                                }
+                            } else {
+                                for option in crate::tts::REMOTE_VOICES {
+                                    if theme_option(
+                                        ui,
+                                        &palette,
+                                        &option.label(locale),
+                                        option.name == voice,
+                                    ) {
+                                        app.actions
+                                            .push(Action::SetTtsVoice(option.name.to_owned()));
+                                    }
                                 }
                             }
                         }
@@ -2318,45 +2333,24 @@ fn tts_panel(app: &mut App, ui: &mut egui::Ui) {
                 theme::reveal_focus(&response.response);
             });
             if source == crate::settings::TtsSource::Remote {
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let endpoint_width = (ui.available_width() * 0.60).max(120.0);
-                    let resp = egui::TextEdit::singleline(&mut app.settings.tts_endpoint)
-                        .id(egui::Id::new("tts-endpoint"))
-                        .desired_width(endpoint_width)
-                        .hint_text(
-                            egui::RichText::new(
-                                crate::i18n::gettext(locale, "Service address").into_owned(),
-                            )
-                            .color(palette.dim)
-                            .font(theme::regular(BODY_SIZE)),
+                    let endpoint_text = format!("Endpoint: {}", app.settings.tts_endpoint);
+                    theme::text(ui, endpoint_text, theme::regular(11.0), palette.dim);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::soft_button(
+                            ui,
+                            &palette,
+                            Some(Icon::Settings),
+                            &crate::i18n::gettext(locale, "Configure service"),
+                            false,
                         )
-                        .font(theme::regular(BODY_SIZE))
-                        .text_color(palette.text)
-                        .show(ui);
-                    if resp.response.changed() {
-                        app.actions
-                            .push(Action::SetTtsEndpoint(app.settings.tts_endpoint.clone()));
-                    }
-                    let token_resp = egui::TextEdit::singleline(&mut app.tts_token)
-                        .id(egui::Id::new("tts-token"))
-                        .desired_width(f32::INFINITY)
-                        .password(true)
-                        .hint_text(
-                            egui::RichText::new(
-                                crate::i18n::gettext(locale, "Service token").into_owned(),
-                            )
-                            .color(palette.dim)
-                            .font(theme::regular(BODY_SIZE)),
-                        )
-                        .font(theme::regular(BODY_SIZE))
-                        .text_color(palette.text)
-                        .show(ui);
-                    if token_resp.response.changed() {
-                        app.actions.push(Action::SetTtsKey(app.tts_token.clone()));
-                    }
+                        .clicked()
+                        {
+                            app.actions.push(Action::Open(crate::model::Page::Settings));
+                        }
+                    });
                 });
-                let _ = endpoint;
             }
             ui.add_space(8.0);
             if let Some(error) = &error {

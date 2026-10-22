@@ -3090,3 +3090,71 @@ msgstr "voz feminina, a clássica"
 #: src/tts.rs
 msgid "a lighter man's voice"
 msgstr "voz masculina mais leve"
+
+#: src/ui/settings.rs
+msgid "Endpoint URL"
+msgstr "URL do endpoint"
+
+#: src/ui/settings.rs
+msgid "Point to an OpenAI-compatible server on your local network (e.g.: Ollama, LM Studio, vLLM or llama-server)."
+msgstr "Aponte para um servidor compatível com OpenAI na sua rede local (ex.: Ollama, LM Studio, vLLM ou llama-server)."
+
+#: src/ui/settings.rs
+msgid "API key (optional)"
+msgstr "Chave API (opcional)"
+
+#: src/ui/settings.rs
+msgid "Optional. Sent as Bearer token for authentication. Separate from your OpenAI API key."
+msgstr "Opcional. Enviada como token Bearer para autenticação. Separada da sua chave API da OpenAI."
+
+#: src/ui/settings.rs
+msgid "Available models"
+msgstr "Modelos disponíveis"
+
+#: src/ui/settings.rs
+msgid "We will consult {} for available models."
+msgstr "Vamos consultar {} para modelos disponíveis."
+
+#: src/ui/settings.rs
+msgid "Search models..."
+msgstr "Pesquisar modelos..."
+
+#: src/ui/settings.rs
+msgid "Refresh"
+msgstr "Atualizar"
+
+#: src/ui/settings.rs
+msgid "Fetching..."
+msgstr "Buscando..."
+
+#: src/ui/settings.rs
+msgid "Fetching available models..."
+msgstr "Consultando modelos disponíveis..."
+
+#: src/ui/settings.rs
+msgid "Failed to load models"
+msgstr "Falha ao consultar modelos"
+
+#: src/ui/settings.rs
+msgid "Retry"
+msgstr "Tentar novamente"
+
+#: src/ui/settings.rs
+msgid "SELECTED"
+msgstr "SELECIONADO"
+
+#: src/ui/settings.rs
+msgid "Owner"
+msgstr "Proprietário"
+
+#: src/ui/settings.rs
+msgid "Edit"
+msgstr "Editar"
+
+#: src/ui/conversation.rs
+msgid "Configure service"
+msgstr "Configurar serviço"
+
+#: src/ui/settings.rs
+msgid "API key"
+msgstr "Chave API"
